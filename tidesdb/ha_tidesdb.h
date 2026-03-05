@@ -221,6 +221,7 @@ class ha_tidesdb : public handler
 
     /* Covering-index mode (HA_EXTRA_KEYREAD) */
     bool keyread_only_;
+    bool write_can_replace_; /* true during REPLACE INTO / INSERT ON DUPLICATE KEY UPDATE */
 
     /* ----- private helpers ----------------------------------------------------------------------
      */

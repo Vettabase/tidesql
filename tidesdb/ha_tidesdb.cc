@@ -790,7 +790,8 @@ ha_tidesdb::ha_tidesdb(handlerton *hton, TABLE_SHARE *table_arg)
       idx_search_comp_len_(0),
       in_bulk_insert_(false),
       bulk_insert_ops_(0),
-      keyread_only_(false)
+      keyread_only_(false),
+      write_can_replace_(false)
 {
 }
 
@@ -1898,6 +1899,61 @@ int ha_tidesdb::write_row(const uchar *buf)
     if (unlikely(srv_debug_trace))
     {
         t2 = tdb_now_us();
+    }
+
+    /* We check PK uniqueness before inserting (TidesDB put overwrites silently).
+       Skip when REPLACE INTO or INSERT ON DUPLICATE KEY UPDATE -- the server
+       handles the conflict by deleting the old row first (HA_EXTRA_WRITE_CAN_REPLACE). */
+    if (share->has_user_pk && !write_can_replace_)
+    {
+        uint8_t *dup_val = NULL;
+        size_t dup_len = 0;
+        int grc = tidesdb_txn_get(txn, share->cf, dk, dk_len, &dup_val, &dup_len);
+        if (grc == TDB_SUCCESS)
+        {
+            tidesdb_free(dup_val);
+            errkey = lookup_errkey = share->pk_index;
+            tmp_restore_column_map(&table->read_set, old_map);
+            DBUG_RETURN(HA_ERR_FOUND_DUPP_KEY);
+        }
+        if (grc != TDB_ERR_NOT_FOUND)
+        {
+            tmp_restore_column_map(&table->read_set, old_map);
+            DBUG_RETURN(tdb_rc_to_ha(grc, "write_row pk_dup_check"));
+        }
+    }
+
+    /* We check UNIQUE secondary index uniqueness via prefix scan */
+    if (share->num_secondary_indexes > 0 && !write_can_replace_)
+    {
+        for (uint i = 0; i < table->s->keys; i++)
+        {
+            if (share->has_user_pk && i == share->pk_index) continue;
+            if (i >= share->idx_cfs.size() || !share->idx_cfs[i]) continue;
+            if (!(table->key_info[i].flags & HA_NOSAME)) continue;
+
+            uchar idx_prefix[MAX_KEY_LENGTH];
+            uint idx_prefix_len = make_comparable_key(
+                &table->key_info[i], buf, table->key_info[i].user_defined_key_parts, idx_prefix);
+            tidesdb_iter_t *dup_iter = NULL;
+            if (tidesdb_iter_new(txn, share->idx_cfs[i], &dup_iter) != TDB_SUCCESS || !dup_iter)
+                continue;
+            tidesdb_iter_seek(dup_iter, idx_prefix, idx_prefix_len);
+            if (tidesdb_iter_valid(dup_iter))
+            {
+                uint8_t *fk = NULL;
+                size_t fks = 0;
+                if (tidesdb_iter_key(dup_iter, &fk, &fks) == TDB_SUCCESS && fks >= idx_prefix_len &&
+                    memcmp(fk, idx_prefix, idx_prefix_len) == 0)
+                {
+                    tidesdb_iter_free(dup_iter);
+                    errkey = lookup_errkey = i;
+                    tmp_restore_column_map(&table->read_set, old_map);
+                    DBUG_RETURN(HA_ERR_FOUND_DUPP_KEY);
+                }
+            }
+            tidesdb_iter_free(dup_iter);
+        }
     }
 
     /* We compute TTL only when the table has TTL configured */
@@ -3439,6 +3495,13 @@ int ha_tidesdb::extra(enum ha_extra_function operation)
             break;
         case HA_EXTRA_NO_KEYREAD:
             keyread_only_ = false;
+            break;
+        case HA_EXTRA_WRITE_CAN_REPLACE:
+        case HA_EXTRA_INSERT_WITH_UPDATE:
+            write_can_replace_ = true;
+            break;
+        case HA_EXTRA_WRITE_CANNOT_REPLACE:
+            write_can_replace_ = false;
             break;
         case HA_EXTRA_PREPARE_FOR_DROP:
             /* Table is about to be dropped -- skip fsync overhead */
