@@ -19,6 +19,7 @@
 #include <mysql/plugin.h>
 
 #include <cstring>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -3824,6 +3825,17 @@ bool ha_tidesdb::inplace_alter_table(TABLE *altered_table, Alter_inplace_info *h
 
     ha_rows rows_processed = 0;
 
+    /* For UNIQUE indexes, we track seen index-column prefixes to detect
+       duplicates.  If a duplicate is found we must abort the ALTER. */
+    std::vector<bool> idx_is_unique(ctx->add_cfs.size(), false);
+    std::vector<std::set<std::string>> idx_seen(ctx->add_cfs.size());
+    for (uint a = 0; a < ctx->add_cfs.size(); a++)
+    {
+        uint key_num = ctx->add_key_nums[a];
+        KEY *ki = &altered_table->key_info[key_num];
+        if (ki->flags & HA_NOSAME) idx_is_unique[a] = true;
+    }
+
     /* We remember the last data key so we can seek directly to it after
        a batch commit, instead of walking from the beginning (O(n²)). */
     uchar last_data_key[MAX_KEY_LENGTH + 2];
@@ -3902,6 +3914,22 @@ bool ha_tidesdb::inplace_alter_table(TABLE *altered_table, Alter_inplace_info *h
                 pos += kp->length;
                 if (field->real_maybe_null()) pos++;
             }
+            /* Check UNIQUE constraint before inserting */
+            if (idx_is_unique[a])
+            {
+                std::string prefix((const char *)ik, pos);
+                if (!idx_seen[a].insert(prefix).second)
+                {
+                    /* Duplicate found -- abort the ALTER */
+                    tidesdb_iter_free(iter);
+                    tidesdb_txn_rollback(txn);
+                    tidesdb_txn_free(txn);
+                    tmp_restore_column_map(&altered_table->read_set, old_map);
+                    my_error(ER_DUP_ENTRY, MYF(0), "?", altered_table->key_info[key_num].name.str);
+                    DBUG_RETURN(true);
+                }
+            }
+
             /* We append PK to make the key unique */
             memcpy(ik + pos, pk, pk_len);
             pos += pk_len;
