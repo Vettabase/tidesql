@@ -4,18 +4,18 @@
 #
 
 --echo # ---- setup ----
-CREATE TABLE t1 (
+CREATE TABLE t_info_schema (
   id INT PRIMARY KEY,
   val VARCHAR(200)
 ) ENGINE=TidesDB;
 
-INSERT INTO t1 VALUES (1, REPEAT('a', 100));
-INSERT INTO t1 VALUES (2, REPEAT('b', 100));
-INSERT INTO t1 VALUES (3, REPEAT('c', 100));
+INSERT INTO t_info_schema VALUES (1, REPEAT('a', 100));
+INSERT INTO t_info_schema VALUES (2, REPEAT('b', 100));
+INSERT INTO t_info_schema VALUES (3, REPEAT('c', 100));
 
 --echo # ---- data_length must be non-zero ----
 let $data_len = `SELECT DATA_LENGTH FROM information_schema.TABLES
-                  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 't1'`;
+                  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 't_info_schema'`;
 if (!$data_len)
 {
   --echo FAIL: DATA_LENGTH is 0
@@ -27,7 +27,7 @@ if ($data_len)
 
 --echo # ---- table_rows must reflect inserted rows ----
 let $rows = `SELECT TABLE_ROWS FROM information_schema.TABLES
-              WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 't1'`;
+              WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 't_info_schema'`;
 if ($rows < 3)
 {
   --echo FAIL: TABLE_ROWS < 3
@@ -38,16 +38,16 @@ if ($rows >= 3)
 }
 
 --echo # ---- add secondary index and check index_length ----
-ALTER TABLE t1 ADD INDEX idx_val (val);
+ALTER TABLE t_info_schema ADD INDEX idx_val (val);
 
 # force stats refresh (2s cache)
 --sleep 3
 
 # touch the table so info() is called fresh
-SELECT COUNT(*) FROM t1;
+SELECT COUNT(*) FROM t_info_schema;
 
 let $idx_len = `SELECT INDEX_LENGTH FROM information_schema.TABLES
-                 WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 't1'`;
+                 WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 't_info_schema'`;
 if (!$idx_len)
 {
   --echo FAIL: INDEX_LENGTH is 0
@@ -62,16 +62,16 @@ if ($idx_len)
 let $i = 4;
 while ($i <= 200)
 {
-  eval INSERT INTO t1 VALUES ($i, REPEAT('x', 100));
+  eval INSERT INTO t_info_schema VALUES ($i, REPEAT('x', 100));
   inc $i;
 }
 --enable_query_log
 
 --sleep 3
-SELECT COUNT(*) FROM t1;
+SELECT COUNT(*) FROM t_info_schema;
 
 let $data_len2 = `SELECT DATA_LENGTH FROM information_schema.TABLES
-                   WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 't1'`;
+                   WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 't_info_schema'`;
 if (!$data_len2)
 {
   --echo FAIL: DATA_LENGTH is 0 after bulk insert
@@ -81,5 +81,45 @@ if ($data_len2)
   --echo OK: DATA_LENGTH > 0 after bulk insert
 }
 
+--echo # ---- create_time must be non-null ----
+let $ct = `SELECT CREATE_TIME FROM information_schema.TABLES
+            WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 't_info_schema'`;
+if (!$ct)
+{
+  --echo FAIL: CREATE_TIME is NULL
+}
+if ($ct)
+{
+  --echo OK: CREATE_TIME is set
+}
+
+--echo # ---- update_time must be non-null after DML ----
+let $ut = `SELECT UPDATE_TIME FROM information_schema.TABLES
+            WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 't_info_schema'`;
+if (!$ut)
+{
+  --echo FAIL: UPDATE_TIME is NULL
+}
+if ($ut)
+{
+  --echo OK: UPDATE_TIME is set
+}
+
+--echo # ---- update_time advances after more DML ----
+let $ut1 = `SELECT UNIX_TIMESTAMP(UPDATE_TIME) FROM information_schema.TABLES
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 't_info_schema'`;
+--sleep 2
+INSERT INTO t_info_schema VALUES (9999, 'timestamp_test');
+let $ut2 = `SELECT UNIX_TIMESTAMP(UPDATE_TIME) FROM information_schema.TABLES
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 't_info_schema'`;
+if ($ut2 >= $ut1)
+{
+  --echo OK: UPDATE_TIME advanced after INSERT
+}
+if ($ut2 < $ut1)
+{
+  --echo FAIL: UPDATE_TIME did not advance
+}
+
 --echo # ---- cleanup ----
-DROP TABLE t1;
+DROP TABLE t_info_schema;

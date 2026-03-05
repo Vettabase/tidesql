@@ -117,6 +117,10 @@ class TidesDB_share : public Handler_share
     bool has_ttl;               /* true when TTL is configured (default_ttl or ttl_field_idx) */
     uint num_secondary_indexes; /* count of non-NULL secondary index CFs */
 
+    /* Table timestamps for information_schema.TABLES */
+    time_t create_time{0};              /* from .frm stat at first open */
+    std::atomic<time_t> update_time{0}; /* bumped on DML (write/update/delete) */
+
     /* Cached stats -- avoid expensive tidesdb_get_stats per statement.
        Refreshed at most every 2 seconds; read with relaxed atomics. */
     std::atomic<ha_rows> cached_records{0};

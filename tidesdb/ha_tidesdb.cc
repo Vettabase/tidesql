@@ -1429,6 +1429,14 @@ int ha_tidesdb::open(const char *name, int mode, uint test_if_locked)
 
         /* We recover hidden-PK counter (auto-inc is derived at runtime via index_last) */
         recover_counters();
+
+        /* We seed create_time from the .frm file's mtime */
+        {
+            char frm_path[FN_REFLEN];
+            fn_format(frm_path, name, "", reg_ext, MY_UNPACK_FILENAME | MY_APPEND_EXT);
+            MY_STAT st_buf;
+            if (mysql_file_stat(0, frm_path, &st_buf, MYF(0))) share->create_time = st_buf.st_mtime;
+        }
     }
     unlock_shared_ha_data();
 
@@ -3091,6 +3099,13 @@ int ha_tidesdb::info(uint flag)
         stats.mrr_length_per_rec = ref_length + 8;
     }
 
+    /* HA_STATUS_TIME -- create_time from .frm stat, update_time from last DML */
+    if ((flag & HA_STATUS_TIME) && share)
+    {
+        stats.create_time = share->create_time;
+        stats.update_time = share->update_time.load(std::memory_order_relaxed);
+    }
+
     /* HA_STATUS_CONST       -- set rec_per_key for index selectivity estimates.
        For PK (unique)       -- rec_per_key = 1.
        For secondary indexes -- we estimate from total_keys / distinct count.
@@ -3535,6 +3550,9 @@ int ha_tidesdb::external_lock(THD *thd, int lock_type)
             scan_iter_cf_ = NULL;
             scan_iter_txn_ = NULL;
         }
+        /* We bump update_time once per write-statement for information_schema */
+        if (stmt_txn_dirty && share) share->update_time.store(time(0), std::memory_order_relaxed);
+
         stmt_txn = NULL;
         stmt_txn_dirty = false;
     }
