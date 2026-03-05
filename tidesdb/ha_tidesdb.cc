@@ -3042,7 +3042,16 @@ int ha_tidesdb::info(uint flag)
             if (tidesdb_get_stats(share->cf, &st) == TDB_SUCCESS && st)
             {
                 share->cached_records.store(st->total_keys, std::memory_order_relaxed);
-                share->cached_data_size.store(st->total_data_size, std::memory_order_relaxed);
+
+                /* total_data_size only counts SSTable klog+vlog; memtable_size
+                   holds the active memtable footprint.  Sum both so that
+                   DATA_LENGTH in information_schema.TABLES is non-zero even
+                   before the first flush.  When both are 0 (library gap),
+                   fall back to total_keys * avg entry size. */
+                uint64_t data_sz = st->total_data_size + (uint64_t)st->memtable_size;
+                if (data_sz == 0 && st->total_keys > 0)
+                    data_sz = (uint64_t)(st->total_keys * (st->avg_key_size + st->avg_value_size));
+                share->cached_data_size.store(data_sz, std::memory_order_relaxed);
                 uint32_t mrl = (uint32_t)(st->avg_key_size + st->avg_value_size);
                 if (mrl == 0) mrl = table->s->reclength;
                 share->cached_mean_rec_len.store(mrl, std::memory_order_relaxed);
@@ -3057,7 +3066,11 @@ int ha_tidesdb::info(uint flag)
                     tidesdb_stats_t *ist = NULL;
                     if (tidesdb_get_stats(share->idx_cfs[i], &ist) == TDB_SUCCESS && ist)
                     {
-                        idx_total += ist->total_data_size;
+                        uint64_t isz = ist->total_data_size + (uint64_t)ist->memtable_size;
+                        if (isz == 0 && ist->total_keys > 0)
+                            isz = (uint64_t)(ist->total_keys *
+                                             (ist->avg_key_size + ist->avg_value_size));
+                        idx_total += isz;
                         tidesdb_free_stats(ist);
                     }
                 }
@@ -4118,8 +4131,8 @@ maria_declare_plugin(tidesdb){
     PLUGIN_LICENSE_GPL,
     tidesdb_init_func,
     tidesdb_deinit_func,
-    0x30305,
+    0x30306,
     NULL,
     tidesdb_system_variables,
-    "3.3.5",
+    "3.3.6",
     MariaDB_PLUGIN_MATURITY_EXPERIMENTAL} maria_declare_plugin_end;
