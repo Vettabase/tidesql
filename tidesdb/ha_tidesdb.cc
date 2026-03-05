@@ -43,6 +43,14 @@ static inline long long tdb_now_us()
     return (long long)microsecond_interval_timer();
 }
 
+/* MariaDB 12.3 moved option_struct from TABLE_SHARE to TABLE (MDEV-37815).
+   We provide a compat macro so the same code compiles on 11.x / 12.0-12.2 / 12.3+. */
+#if MYSQL_VERSION_ID >= 120300
+#define TDB_TABLE_OPTIONS(tbl) ((tbl)->option_struct)
+#else
+#define TDB_TABLE_OPTIONS(tbl) ((tbl)->s->option_struct)
+#endif
+
 /* Declared early so tdb_rc_to_ha() can reference it; default 0,
    toggled at runtime via SET GLOBAL tidesdb_debug_trace. */
 static my_bool srv_debug_trace = 0;
@@ -128,7 +136,7 @@ static ulong srv_max_open_sstables = 256;
 static ulonglong srv_max_memory_usage = 0; /* 0 = auto (library decides) */
 
 static const char *log_level_names[] = {"DEBUG", "INFO", "WARN", "ERROR", "FATAL", "NONE", NullS};
-#if MYSQL_VERSION_ID >= 120000
+#if MYSQL_VERSION_ID >= 110800
 static TYPELIB log_level_typelib = {array_elements(log_level_names) - 1, "log_level_typelib",
                                     log_level_names, NULL, NULL};
 #else
@@ -504,7 +512,7 @@ static int tidesdb_savepoint_release(THD *thd, void *sv)
     return tdb_rc_to_ha(rc, "savepoint_release");
 }
 
-#if MYSQL_VERSION_ID >= 120000
+#if MYSQL_VERSION_ID >= 110800
 static int tidesdb_commit(THD *thd, bool all)
 #else
 static int tidesdb_commit(handlerton *, THD *thd, bool all)
@@ -585,7 +593,7 @@ static int tidesdb_commit(handlerton *, THD *thd, bool all)
     return 0;
 }
 
-#if MYSQL_VERSION_ID >= 120000
+#if MYSQL_VERSION_ID >= 110800
 static int tidesdb_rollback(THD *thd, bool all)
 #else
 static int tidesdb_rollback(handlerton *, THD *thd, bool all)
@@ -629,7 +637,7 @@ static int tidesdb_rollback(handlerton *, THD *thd, bool all)
     return 0;
 }
 
-#if MYSQL_VERSION_ID >= 120000
+#if MYSQL_VERSION_ID >= 110800
 static int tidesdb_close_connection(THD *thd)
 #else
 static int tidesdb_close_connection(handlerton *, THD *thd)
@@ -1352,24 +1360,24 @@ int ha_tidesdb::open(const char *name, int mode, uint test_if_locked)
         }
 
         /* We read isolation level from table options */
-        if (table->s->option_struct)
+        if (TDB_TABLE_OPTIONS(table))
         {
-            uint iso_idx = table->s->option_struct->isolation_level;
+            uint iso_idx = TDB_TABLE_OPTIONS(table)->isolation_level;
             if (iso_idx < array_elements(tdb_isolation_map))
                 share->isolation_level = (tidesdb_isolation_level_t)tdb_isolation_map[iso_idx];
         }
 
         /* We read TTL configuration from table + field options */
-        if (table->s->option_struct) share->default_ttl = table->s->option_struct->ttl;
+        if (TDB_TABLE_OPTIONS(table)) share->default_ttl = TDB_TABLE_OPTIONS(table)->ttl;
 
         /* We read encryption configuration from table options */
         share->encrypted = false;
         share->encryption_key_id = 1;
         share->encryption_key_version = 0;
-        if (table->s->option_struct && table->s->option_struct->encrypted)
+        if (TDB_TABLE_OPTIONS(table) && TDB_TABLE_OPTIONS(table)->encrypted)
         {
             share->encrypted = true;
-            share->encryption_key_id = (uint)table->s->option_struct->encryption_key_id;
+            share->encryption_key_id = (uint)TDB_TABLE_OPTIONS(table)->encryption_key_id;
             uint ver = encryption_key_get_latest_version(share->encryption_key_id);
             if (ver == ENCRYPTION_KEY_VERSION_INVALID)
             {
@@ -1472,7 +1480,7 @@ int ha_tidesdb::create(const char *name, TABLE *table_arg, HA_CREATE_INFO *creat
 
     std::string cf_name = path_to_cf_name(name);
 
-    ha_table_option_struct *opts = table_arg->s->option_struct;
+    ha_table_option_struct *opts = TDB_TABLE_OPTIONS(table_arg);
     DBUG_ASSERT(opts);
 
     tidesdb_column_family_config_t cfg = build_cf_config(opts);
@@ -2942,7 +2950,7 @@ int ha_tidesdb::delete_all_rows(void)
         stmt_txn_dirty = false;
     }
 
-    tidesdb_column_family_config_t cfg = build_cf_config(table->s->option_struct);
+    tidesdb_column_family_config_t cfg = build_cf_config(TDB_TABLE_OPTIONS(table));
 
     /* We drop and recreate the main data CF (O(1) instead of iterating all keys) */
     {
@@ -3640,7 +3648,7 @@ bool ha_tidesdb::prepare_inplace_alter_table(TABLE *altered_table,
     }
     ha_alter_info->handler_ctx = ctx;
 
-    tidesdb_column_family_config_t cfg = build_cf_config(table->s->option_struct);
+    tidesdb_column_family_config_t cfg = build_cf_config(TDB_TABLE_OPTIONS(table));
 
     std::string base_cf = share->cf_name;
 
