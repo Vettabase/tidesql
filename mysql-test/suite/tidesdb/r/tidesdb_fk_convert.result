@@ -1,5 +1,8 @@
 #
 # Issue #61: Converting InnoDB tables with foreign keys to TidesDB
+# Requires a server-side patch to sql/sql_table.cc that honours
+# FOREIGN_KEY_CHECKS=0 during can_switch_engines().  If the patch
+# is absent (upstream MariaDB), the test is skipped.
 #
 # Create an InnoDB table with a self-referencing foreign key
 CREATE TABLE t_fk61 (
@@ -24,6 +27,7 @@ t_fk61	CREATE TABLE `t_fk61` (
 ALTER TABLE t_fk61 ENGINE=TidesDB;
 ERROR 23000: Cannot delete or update a parent row: a foreign key constraint fails
 # With FOREIGN_KEY_CHECKS=0, the conversion should succeed
+# (requires server patch; skip if absent)
 SET FOREIGN_KEY_CHECKS=0;
 ALTER TABLE t_fk61 ENGINE=TidesDB;
 SET FOREIGN_KEY_CHECKS=1;

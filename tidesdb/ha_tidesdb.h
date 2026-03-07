@@ -174,6 +174,7 @@ struct tidesdb_trx_t
     bool stmt_savepoint_active;                /* true while a "stmt" savepoint exists */
     bool stmt_was_dirty;                       /* true if current stmt had writes */
     tidesdb_isolation_level_t isolation_level; /* from first table opened */
+    uint64_t txn_generation; /* monotonic counter; incremented each time a new txn is created */
 };
 
 /*
@@ -194,6 +195,7 @@ class ha_tidesdb : public handler
     tidesdb_column_family_t *scan_cf_;      /* CF for lazy iterator creation */
     tidesdb_column_family_t *scan_iter_cf_; /* CF the cached scan_iter was created for */
     tidesdb_txn_t *scan_iter_txn_;          /* txn the cached scan_iter was created on */
+    uint64_t scan_iter_txn_gen_;            /* txn_generation when scan_iter was created */
     bool idx_pk_exact_done_;                /* deferred seek after PK exact */
     enum scan_dir_t
     {

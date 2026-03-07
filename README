@@ -19,6 +19,28 @@ The install script will build TidesDB and MariaDB from source.
 You can specify the versions if you want.  The script will install everything
 and make TidesDB available as an engine to utilize.
 
+To skip storage engines you don't need (saves build time and reduces warnings):
+
+./install.sh --list-engines                       # see what can be skipped
+./install.sh --skip-engines mroonga,rocksdb,connect,spider,oqgraph,columnstore
+
+Skippable engines:
+  archive        Archive storage engine (read-only row-format tables)
+  blackhole      Blackhole engine (accepts writes, stores nothing)
+  columnstore    MariaDB ColumnStore (columnar analytics engine)
+  connect        CONNECT engine (access external data sources)
+  example        Example storage engine (test/demo only)
+  federated      Legacy Federated engine (MODULE_ONLY)
+  federatedx     FederatedX engine (query remote MySQL/MariaDB tables)
+  mroonga        Mroonga full-text search engine (requires Groonga)
+  oqgraph        Open Query GRAPH engine (graph computation)
+  rocksdb        MyRocks / RocksDB LSM-tree engine
+  sequence       Sequence engine (virtual auto-increment sequences)
+  sphinx         SphinxSE engine (Sphinx full-text search integration)
+  spider         Spider engine (sharding / federation)
+
+InnoDB, Aria, MyISAM, and CSV cannot be skipped (server depends on them).
+
 Below are manual install instructions for those who want to configure everything
 themselves, though with the install script you can modify configuration files
 after the fact.

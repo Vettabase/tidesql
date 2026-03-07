@@ -442,6 +442,7 @@ static tidesdb_trx_t *get_or_create_trx(THD *thd, handlerton *hton, tidesdb_isol
             }
             trx->dirty = false;
             trx->isolation_level = iso;
+            trx->txn_generation++;
         }
         return trx;
     }
@@ -458,6 +459,7 @@ static tidesdb_trx_t *get_or_create_trx(THD *thd, handlerton *hton, tidesdb_isol
     }
     trx->dirty = false;
     trx->isolation_level = iso;
+    trx->txn_generation = 1;
     thd_set_ha_data(thd, hton, trx);
     return trx;
 }
@@ -2125,7 +2127,11 @@ int ha_tidesdb::rnd_init(bool scan)
     }
     scan_txn = stmt_txn;
 
-    if (scan_iter && (scan_iter_cf_ != share->cf || scan_iter_txn_ != scan_txn))
+    tidesdb_trx_t *trx = (tidesdb_trx_t *)thd_get_ha_data(ha_thd(), ht);
+    uint64_t cur_gen = trx ? trx->txn_generation : 0;
+
+    if (scan_iter &&
+        (scan_iter_cf_ != share->cf || scan_iter_txn_ != scan_txn || scan_iter_txn_gen_ != cur_gen))
     {
         tidesdb_iter_free(scan_iter);
         scan_iter = NULL;
@@ -2143,6 +2149,7 @@ int ha_tidesdb::rnd_init(bool scan)
         }
         scan_iter_cf_ = share->cf;
         scan_iter_txn_ = scan_txn;
+        scan_iter_txn_gen_ = cur_gen;
     }
 
     /* We seek past meta keys to the first data key */
@@ -2238,11 +2245,18 @@ int ha_tidesdb::index_init(uint idx, bool sorted)
        (each builds a merge heap from all SSTables).
 
        If the txn changed (e.g. after COMMIT created a new one), the
-       iterator holds a stale txn pointer and must be recreated. */
-    if (scan_iter && (scan_iter_cf_ != target_cf || scan_iter_txn_ != scan_txn))
+       iterator holds a stale txn pointer and must be recreated.
+       We compare both the pointer and a monotonic generation counter
+       because the allocator can reuse the same address for a new txn. */
+    tidesdb_trx_t *trx = (tidesdb_trx_t *)thd_get_ha_data(ha_thd(), ht);
+    uint64_t cur_gen = trx ? trx->txn_generation : 0;
+
+    if (scan_iter &&
+        (scan_iter_cf_ != target_cf || scan_iter_txn_ != scan_txn || scan_iter_txn_gen_ != cur_gen))
     {
-        TDB_TRACE("idx=%u iter INVALIDATED (cf %p->%p txn %p->%p)", idx, scan_iter_cf_, target_cf,
-                  scan_iter_txn_, scan_txn);
+        TDB_TRACE("idx=%u iter INVALIDATED (cf %p->%p txn %p->%p gen %lu->%lu)", idx, scan_iter_cf_,
+                  target_cf, scan_iter_txn_, scan_txn, (unsigned long)scan_iter_txn_gen_,
+                  (unsigned long)cur_gen);
         tidesdb_iter_free(scan_iter);
         scan_iter = NULL;
         scan_iter_cf_ = NULL;
@@ -2270,6 +2284,8 @@ int ha_tidesdb::ensure_scan_iter()
     {
         scan_iter_cf_ = scan_cf_;
         scan_iter_txn_ = scan_txn;
+        tidesdb_trx_t *trx = (tidesdb_trx_t *)thd_get_ha_data(ha_thd(), ht);
+        scan_iter_txn_gen_ = trx ? trx->txn_generation : 0;
         return 0;
     }
     return tdb_rc_to_ha(rc, "ensure_scan_iter");

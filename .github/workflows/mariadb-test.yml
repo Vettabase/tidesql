@@ -99,7 +99,6 @@ jobs:
       uses: actions/cache@v4
       with:
         path: |
-          tidesdb-lib/build
           /usr/local/lib/libtidesdb*
           /usr/local/include/tidesdb*
           C:/tidesdb
@@ -149,24 +148,12 @@ jobs:
         echo "CMAKE_TOOLCHAIN_FILE=$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" >> $env:GITHUB_ENV
         echo "TIDESDB_ROOT=C:/tidesdb" >> $env:GITHUB_ENV
 
-    - name: Get latest MariaDB release tag
+    - name: Set MariaDB version
       id: mariadb-release
       shell: bash
-      env:
-        GH_TOKEN: ${{ github.token }}
       run: |
-        for i in 1 2 3; do
-          LATEST_TAG=$(curl -s -H "Authorization: Bearer $GH_TOKEN" https://api.github.com/repos/MariaDB/server/releases/latest | jq -r '.tag_name')
-          if [ -n "$LATEST_TAG" ] && [ "$LATEST_TAG" != "null" ]; then
-            echo "tag=${LATEST_TAG}" >> $GITHUB_OUTPUT
-            echo "Latest MariaDB release: ${LATEST_TAG}"
-            exit 0
-          fi
-          echo "Attempt $i: Failed to get tag (got: $LATEST_TAG), retrying in 5s..."
-          sleep 5
-        done
-        echo "Failed to get MariaDB release tag after 3 attempts, using fallback"
-        echo "tag=mariadb-12.2.2" >> $GITHUB_OUTPUT
+        echo "tag=mariadb-12.1.2" >> $GITHUB_OUTPUT
+        echo "MariaDB version: mariadb-12.1.2"
 
     - name: Clone MariaDB server
       shell: bash
@@ -189,6 +176,7 @@ jobs:
     - name: Install TidesDB library (Ubuntu)
       if: runner.os == 'Linux'
       run: |
+        rm -rf tidesdb-lib
         for i in 1 2 3; do
           if git clone --depth 1 https://github.com/tidesdb/tidesdb.git tidesdb-lib; then
             break
@@ -212,6 +200,7 @@ jobs:
         sudo xcode-select -s /Applications/Xcode_16.4.app/Contents/Developer
         export SDKROOT=$(xcrun --show-sdk-path)
         
+        rm -rf tidesdb-lib
         for i in 1 2 3; do
           if git clone --depth 1 https://github.com/tidesdb/tidesdb.git tidesdb-lib; then
             break
@@ -232,6 +221,7 @@ jobs:
       if: runner.os == 'Windows'
       shell: bash
       run: |
+        rm -rf tidesdb-lib
         for i in 1 2 3; do
           if git clone --depth 1 https://github.com/tidesdb/tidesdb.git tidesdb-lib; then
             break
@@ -281,7 +271,6 @@ jobs:
           -DPLUGIN_COLUMNSTORE=NO \
           -DPLUGIN_CONNECT=NO \
           -DPLUGIN_OQGRAPH=NO \
-          -DPLUGIN_TOKUDB=NO \
           -DPLUGIN_ARCHIVE=NO \
           -DWITH_UNIT_TESTS=OFF \
           -DCONC_WITH_UNITTEST=OFF \
@@ -321,7 +310,6 @@ jobs:
           -DPLUGIN_SPIDER=NO \
           -DPLUGIN_ROCKSDB=NO \
           -DPLUGIN_OQGRAPH=NO \
-          -DPLUGIN_TOKUDB=NO \
           -DPLUGIN_COLUMNSTORE=NO \
           -DWITH_UNIT_TESTS=OFF \
           -DCONC_WITH_UNITTEST=OFF \
@@ -342,7 +330,7 @@ jobs:
       run: |
         mkdir build
         cd build
-        cmake .. -G "Visual Studio 17 2022" -A x64 -DPLUGIN_TIDESDB=DYNAMIC -DPLUGIN_ROCKSDB=NO -DPLUGIN_MROONGA=NO -DPLUGIN_SPIDER=NO -DPLUGIN_COLUMNSTORE=NO -DPLUGIN_CONNECT=NO -DWITH_UNIT_TESTS=OFF -DCMAKE_PREFIX_PATH="C:/tidesdb;%VCPKG_INSTALLATION_ROOT%/installed/x64-windows" -DCMAKE_INCLUDE_PATH="C:/tidesdb/include"
+        cmake .. -G "Visual Studio 17 2022" -A x64 -DPLUGIN_TIDESDB=DYNAMIC -DPLUGIN_ROCKSDB=NO -DPLUGIN_MROONGA=NO -DPLUGIN_SPIDER=NO -DPLUGIN_COLUMNSTORE=NO -DPLUGIN_CONNECT=NO -DPLUGIN_OQGRAPH=NO -DPLUGIN_ARCHIVE=NO -DWITH_UNIT_TESTS=OFF -DCMAKE_PREFIX_PATH="C:/tidesdb;%VCPKG_INSTALLATION_ROOT%/installed/x64-windows" -DCMAKE_INCLUDE_PATH="C:/tidesdb/include"
         cmake --build . --config RelWithDebInfo --parallel
 
     - name: Run TidesDB test suite (Linux)
