@@ -117,6 +117,10 @@ class TidesDB_share : public Handler_share
     bool has_ttl;               /* true when TTL is configured (default_ttl or ttl_field_idx) */
     uint num_secondary_indexes; /* count of non-NULL secondary index CFs */
 
+    /* Table timestamps for information_schema.TABLES */
+    time_t create_time{0};              /* from .frm stat at first open */
+    std::atomic<time_t> update_time{0}; /* bumped on DML (write/update/delete) */
+
     /* Cached stats -- avoid expensive tidesdb_get_stats per statement.
        Refreshed at most every 2 seconds; read with relaxed atomics. */
     std::atomic<ha_rows> cached_records{0};
@@ -170,6 +174,7 @@ struct tidesdb_trx_t
     bool stmt_savepoint_active;                /* true while a "stmt" savepoint exists */
     bool stmt_was_dirty;                       /* true if current stmt had writes */
     tidesdb_isolation_level_t isolation_level; /* from first table opened */
+    uint64_t txn_generation; /* monotonic counter; incremented each time a new txn is created */
 };
 
 /*
@@ -190,6 +195,7 @@ class ha_tidesdb : public handler
     tidesdb_column_family_t *scan_cf_;      /* CF for lazy iterator creation */
     tidesdb_column_family_t *scan_iter_cf_; /* CF the cached scan_iter was created for */
     tidesdb_txn_t *scan_iter_txn_;          /* txn the cached scan_iter was created on */
+    uint64_t scan_iter_txn_gen_;            /* txn_generation when scan_iter was created */
     bool idx_pk_exact_done_;                /* deferred seek after PK exact */
     enum scan_dir_t
     {
@@ -217,6 +223,7 @@ class ha_tidesdb : public handler
 
     /* Covering-index mode (HA_EXTRA_KEYREAD) */
     bool keyread_only_;
+    bool write_can_replace_; /* true during REPLACE INTO / INSERT ON DUPLICATE KEY UPDATE */
 
     /* ----- private helpers ----------------------------------------------------------------------
      */
@@ -225,8 +232,6 @@ class ha_tidesdb : public handler
     const std::string &serialize_row(const uchar *buf);
     void deserialize_row(uchar *buf, const uchar *data, size_t len);
     void deserialize_row(uchar *buf, const std::string &row);
-    static std::string path_to_cf_name(const char *path);
-
     /* Build memcmp-comparable key bytes into out[]; returns byte count */
     uint make_comparable_key(KEY *key_info, const uchar *record, uint num_parts, uchar *out);
 
@@ -341,6 +346,9 @@ class ha_tidesdb : public handler
         cost.cpu = (double)rows * TIDESDB_COST_SEQ_READ * amp;
         return cost;
     }
+
+    /* Convert a MariaDB table path to a TidesDB column family name */
+    static std::string path_to_cf_name(const char *path);
 
     /* DDL */
     int open(const char *name, int mode, uint test_if_locked) override;

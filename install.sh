@@ -48,6 +48,8 @@
 #   --jobs            N         Parallel build jobs        (default: auto-detected)
 #   --skip-deps                 Skip system dependency installation
 #   --skip-tidesdb              Skip TidesDB library build (use if already installed)
+#   --skip-engines  ENGINES     Comma-separated list of storage engines to skip
+#   --list-engines              List storage engines that can be skipped and exit
 #   --pgo                       Enable Profile-Guided Optimization (3-phase build)
 #   --help                      Show this help message
 #
@@ -68,6 +70,8 @@
 #   ./install.sh --mariadb-version mariadb-12.1.2
 #   ./install.sh --skip-deps --skip-tidesdb
 #   ./install.sh --pgo          # Full PGO build (instrument → train → optimize)
+#   ./install.sh --list-engines # Show which engines can be skipped
+#   ./install.sh --skip-engines mroonga,rocksdb,connect,spider,oqgraph,columnstore
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
@@ -160,6 +164,27 @@ JOBS="$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)"
 SKIP_DEPS=false
 SKIP_TIDESDB=false
 PGO_ENABLED=false
+SKIP_ENGINES=""
+
+# ── Skippable storage engines ────────────────────────────────────────────────
+# These are MariaDB storage engines that can safely be disabled to save build
+# time and reduce compiler warnings.  InnoDB, Aria, MyISAM, and CSV are NOT
+# listed here because the server or mysql-test framework depends on them.
+SKIPPABLE_ENGINES=(
+    "archive:Archive storage engine (read-only row-format tables)"
+    "blackhole:Blackhole engine (accepts writes, stores nothing)"
+    "columnstore:MariaDB ColumnStore (columnar analytics engine)"
+    "connect:CONNECT engine (access external data sources)"
+    "example:Example storage engine (test/demo only)"
+    "federated:Legacy Federated engine (MODULE_ONLY)"
+    "federatedx:FederatedX engine (query remote MySQL/MariaDB tables)"
+    "mroonga:Mroonga full-text search engine (requires Groonga)"
+    "oqgraph:Open Query GRAPH engine (graph computation)"
+    "rocksdb:MyRocks / RocksDB LSM-tree engine"
+    "sequence:Sequence engine (virtual auto-increment sequences)"
+    "sphinx:SphinxSE engine (Sphinx full-text search integration)"
+    "spider:Spider engine (sharding / federation)"
+)
 
 # ── Color helpers ───────────────────────────────────────────────────────────
 RED='\033[0;31m'
@@ -180,6 +205,21 @@ usage() {
     exit 0
 }
 
+list_engines() {
+    echo ""
+    echo -e "${CYAN}Skippable storage engines:${NC}"
+    echo -e "${CYAN}──────────────────────────────────────────────────────────${NC}"
+    for entry in "${SKIPPABLE_ENGINES[@]}"; do
+        local name="${entry%%:*}"
+        local desc="${entry#*:}"
+        printf "  ${GREEN}%-14s${NC} %s\n" "$name" "$desc"
+    done
+    echo ""
+    echo -e "Usage: ${GREEN}--skip-engines mroonga,rocksdb,connect${NC}"
+    echo ""
+    exit 0
+}
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --tidesdb-version)  TIDESDB_VERSION="$2";  shift 2 ;;
@@ -190,6 +230,8 @@ while [[ $# -gt 0 ]]; do
         --jobs)             JOBS="$2";              shift 2 ;;
         --skip-deps)        SKIP_DEPS=true;         shift   ;;
         --skip-tidesdb)     SKIP_TIDESDB=true;      shift   ;;
+        --skip-engines)     SKIP_ENGINES="$2";      shift 2 ;;
+        --list-engines)     list_engines ;;
         --pgo)              PGO_ENABLED=true;       shift   ;;
         --help|-h)          usage ;;
         *) die "Unknown option: $1 (try --help)" ;;
@@ -229,6 +271,9 @@ _cfg_row "Build directory  : ${GREEN}${BUILD_DIR}${NC}"
 _cfg_row "Parallel jobs    : ${GREEN}${JOBS}${NC}"
 _cfg_row "Detected OS      : ${GREEN}${OS}${NC}"
 _cfg_row "PGO build        : ${GREEN}${PGO_ENABLED}${NC}"
+if [[ -n "$SKIP_ENGINES" ]]; then
+_cfg_row "Skip engines     : ${YELLOW}${SKIP_ENGINES}${NC}"
+fi
 _cfg_row "TideSQL repo     : ${GREEN}${SCRIPT_DIR}${NC}"
 echo -e "${CYAN}╚$(printf '═%.0s' $(seq 1 68))╝${NC}"
 echo ""
@@ -441,6 +486,16 @@ build_mariadb() {
         -DWITH_MARIABACKUP=ON
         -DWITH_UNIT_TESTS=OFF
     )
+
+    # Disable skipped engines
+    if [[ -n "$SKIP_ENGINES" ]]; then
+        IFS=',' read -ra _engines <<< "$SKIP_ENGINES"
+        for _eng in "${_engines[@]}"; do
+            _eng="$(echo "$_eng" | tr -d ' ' | tr '[:lower:]' '[:upper:]')"
+            cmake_args+=("-DPLUGIN_${_eng}=NO")
+            info "Skipping storage engine: ${_eng}"
+        done
+    fi
 
     case "$OS" in
         macos)
@@ -722,6 +777,15 @@ pgo_instrument() {
 
     export TIDESDB_ROOT="${TIDESDB_PREFIX}"
 
+    # Disable skipped engines
+    if [[ -n "$SKIP_ENGINES" ]]; then
+        IFS=',' read -ra _engines <<< "$SKIP_ENGINES"
+        for _eng in "${_engines[@]}"; do
+            _eng="$(echo "$_eng" | tr -d ' ' | tr '[:lower:]' '[:upper:]')"
+            cmake_args+=("-DPLUGIN_${_eng}=NO")
+        done
+    fi
+
     case "$OS" in
         macos)
             local sdk_root cc cxx
@@ -804,6 +868,15 @@ pgo_optimize() {
     )
 
     export TIDESDB_ROOT="${TIDESDB_PREFIX}"
+
+    # Disable skipped engines
+    if [[ -n "$SKIP_ENGINES" ]]; then
+        IFS=',' read -ra _engines <<< "$SKIP_ENGINES"
+        for _eng in "${_engines[@]}"; do
+            _eng="$(echo "$_eng" | tr -d ' ' | tr '[:lower:]' '[:upper:]')"
+            cmake_args+=("-DPLUGIN_${_eng}=NO")
+        done
+    fi
 
     case "$OS" in
         macos)

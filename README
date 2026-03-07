@@ -3,6 +3,8 @@ TIDESQL
 
 A pluggable write and space optimized storage engine for MariaDB using TidesDB.
 
+The pluggable engine is tested and supported on MariaDB 11.x, 12.x.
+
 
 INSTALLATION
 ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
@@ -17,12 +19,34 @@ The install script will build TidesDB and MariaDB from source.
 You can specify the versions if you want.  The script will install everything
 and make TidesDB available as an engine to utilize.
 
+To skip storage engines you don't need (saves build time and reduces warnings):
+
+./install.sh --list-engines                       # see what can be skipped
+./install.sh --skip-engines mroonga,rocksdb,connect,spider,oqgraph,columnstore
+
+Skippable engines:
+  archive        Archive storage engine (read-only row-format tables)
+  blackhole      Blackhole engine (accepts writes, stores nothing)
+  columnstore    MariaDB ColumnStore (columnar analytics engine)
+  connect        CONNECT engine (access external data sources)
+  example        Example storage engine (test/demo only)
+  federated      Legacy Federated engine (MODULE_ONLY)
+  federatedx     FederatedX engine (query remote MySQL/MariaDB tables)
+  mroonga        Mroonga full-text search engine (requires Groonga)
+  oqgraph        Open Query GRAPH engine (graph computation)
+  rocksdb        MyRocks / RocksDB LSM-tree engine
+  sequence       Sequence engine (virtual auto-increment sequences)
+  sphinx         SphinxSE engine (Sphinx full-text search integration)
+  spider         Spider engine (sharding / federation)
+
+InnoDB, Aria, MyISAM, and CSV cannot be skipped (server depends on them).
+
 Below are manual install instructions for those who want to configure everything
 themselves, though with the install script you can modify configuration files
 after the fact.
 
 LINUX (Ubuntu/Debian)
----------------------
+░░░░░░░░░░░░░░░░░░░░░░░░
 
 1. Install dependencies:
 
@@ -61,7 +85,7 @@ LINUX (Ubuntu/Debian)
 
 
 MACOS
------
+░░░░░░░░░░░░░░░░░░░░░░░░
 
 1. Install dependencies:
 
@@ -119,7 +143,7 @@ MACOS
 
 
 WINDOWS
--------
+░░░░░░░░░░░░░░░░░░░░░░░░
 
 1. Install prerequisites:
 
@@ -171,7 +195,7 @@ WINDOWS
 
 
 ENABLE PLUGIN
--------------
+░░░░░░░░░░░░░░░░░░░░░░░░
 
 After building, enable the plugin in MariaDB:
 
@@ -213,7 +237,7 @@ TidesDB stores its data as a sibling of the MariaDB data directory:
 
 
 SYSTEM VARIABLES (SET GLOBAL tidesdb_...)
------------------------------------------
+░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
 
 All are read-only (set at startup) unless noted otherwise.
 
@@ -232,7 +256,7 @@ reduce log volume.
 
 
 TABLE OPTIONS (CREATE TABLE ... ENGINE=TidesDB <option>=<value>)
-----------------------------------------------------------------
+░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
 
 These are per-table options baked into the column family at creation time.
 Changing them via ALTER TABLE only updates the .frm; it does not reconfigure
@@ -284,7 +308,7 @@ Encryption:
 
 
 FIELD OPTIONS (per-column)
---------------------------
+░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
 
   TTL                       Marks column as per-row TTL source (seconds)
 
@@ -326,6 +350,7 @@ Available tests:
   tidesdb_json            JSON querying + generated-column JSON path indexing
   tidesdb_savepoint       SQL SAVEPOINT / ROLLBACK TO / RELEASE SAVEPOINT
   tidesdb_write_pressure  oltp_write_only OOM reproduction (multi-connection)
+  ...
 
 Run with verbose output:
 
