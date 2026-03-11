@@ -1,3 +1,2 @@
 --plugin-load-add=$HA_TIDESDB_SO
---character-set-server=utf8mb4
---collation-server=utf8mb4_general_ci
+--plugin-maturity=unknown

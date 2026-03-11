@@ -6,7 +6,7 @@ INSERT INTO t1 VALUES (1,10),(2,20),(3,30);
 SHOW ENGINE TIDESDB STATUS;
 Type	Name	Status
 TIDESDB		================== TidesDB Engine Status ==================
-Data directory: /home/agpmastersystem/server-mariadb-N.N.N/builddir/mysql-test/var/mysqld.N/tidesdb_data
+Data directory: TIDESDB_DATA_DIR
 Column families: N
 Global sequence: N
 
