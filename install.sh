@@ -612,12 +612,23 @@ install_mariadb() {
 setup_mariadb() {
     local datadir="${MARIADB_PREFIX}/data"
 
-    # Ensure mysql user exists on Unix
-    if [[ "$OS" != "windows" ]]; then
+    # Determine whether this is a system-level install (needs root/mysql user)
+    # or a user-local install (run everything as current user).
+    local use_mysql_user=false
+    if [[ "$OS" != "windows" ]] && _needs_sudo "${MARIADB_PREFIX}"; then
+        use_mysql_user=true
+        # Ensure mysql user exists
         if ! id -u mysql &>/dev/null; then
             info "Creating mysql system user..."
             sudo useradd -r -s /bin/false -d "${datadir}" mysql 2>/dev/null || true
         fi
+    fi
+
+    local run_user
+    if $use_mysql_user; then
+        run_user="mysql"
+    else
+        run_user="$(id -un)"
     fi
 
     # Write config before init so mariadb-install-db can pick it up
@@ -630,12 +641,14 @@ setup_mariadb() {
         info "Creating MariaDB configuration at ${cnf_file}..."
 
         local socket_line="" client_socket="" socket_path="" plugin_ext="so"
+        local user_line=""
         if [[ "$OS" == "windows" ]]; then
             plugin_ext="dll"
         else
             socket_path="/tmp/mariadb.sock"
             socket_line="socket  = ${socket_path}"
             client_socket="socket = ${socket_path}"
+            user_line="user    = ${run_user}"
         fi
 
         local cnf_content
@@ -644,6 +657,7 @@ basedir = ${MARIADB_PREFIX}
 datadir = ${datadir}
 port    = 3306
 ${socket_line}
+${user_line}
 pid-file = ${datadir}/mariadb.pid
 log-error = ${datadir}/mariadb.err
 
@@ -695,7 +709,7 @@ max_allowed_packet = 64M
             echo "$cnf_content" > "${cnf_file}"
         else
             run_privileged mkdir -p "$(dirname "${cnf_file}")"
-            if _needs_sudo "${MARIADB_PREFIX}"; then
+            if $use_mysql_user; then
                 echo "$cnf_content" | sudo tee "${cnf_file}" > /dev/null
             else
                 echo "$cnf_content" > "${cnf_file}"
@@ -728,30 +742,43 @@ max_allowed_packet = 64M
     else
         if [[ "$OS" == "windows" ]]; then
             "${install_db}" \
+                --defaults-file="${cnf_file}" \
                 --basedir="${MARIADB_PREFIX}" \
                 --datadir="${datadir}" 2>&1 || true
-        else
-            run_privileged "${install_db}" \
+        elif $use_mysql_user; then
+            sudo "${install_db}" \
+                --defaults-file="${cnf_file}" \
                 --user=mysql \
                 --basedir="${MARIADB_PREFIX}" \
                 --datadir="${datadir}" 2>&1 || true
-
-            run_privileged chown -R mysql:mysql "${datadir}"
+            sudo chown -R mysql:mysql "${datadir}"
+        else
+            "${install_db}" \
+                --defaults-file="${cnf_file}" \
+                --user="${run_user}" \
+                --basedir="${MARIADB_PREFIX}" \
+                --datadir="${datadir}" 2>&1 || true
         fi
         ok "Data directory initialized"
     fi
 
-    # Set proper ownership on Unix
-    if [[ "$OS" != "windows" && -d "${datadir}" ]]; then
-        run_privileged chown -R mysql:mysql "${datadir}"
+    # Set proper ownership on Unix (only needed for system-level installs)
+    if $use_mysql_user && [[ -d "${datadir}" ]]; then
+        sudo chown -R mysql:mysql "${datadir}"
     fi
 }
 
 print_summary() {
     local cnf_name="my.cnf"
     local start_cmd="${MARIADB_PREFIX}/bin/mariadbd-safe"
-    local connect_cmd="${MARIADB_PREFIX}/bin/mariadb -u root"
     local test_dir="${BUILD_DIR}/mariadb-server/build/mysql-test"
+
+    # Use the correct connect user: root for system installs, current user otherwise
+    local connect_user="root"
+    if [[ "$OS" != "windows" ]] && ! _needs_sudo "${MARIADB_PREFIX}"; then
+        connect_user="$(id -un)"
+    fi
+    local connect_cmd="${MARIADB_PREFIX}/bin/mariadb -u ${connect_user}"
 
     if [[ "$OS" == "windows" ]]; then
         cnf_name="my.ini"
