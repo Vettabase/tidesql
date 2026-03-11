@@ -166,6 +166,16 @@ SKIP_TIDESDB=false
 PGO_ENABLED=false
 SKIP_ENGINES=""
 
+# ── Ensure VCPKG_ROOT is set on Windows (needed even with --skip-deps) ────────
+if [[ "$OS" == "windows" ]]; then
+    if [[ -z "${VCPKG_ROOT:-}" ]]; then
+        if [[ -d "C:/vcpkg" ]]; then
+            VCPKG_ROOT="C:/vcpkg"
+        fi
+    fi
+    export VCPKG_ROOT="${VCPKG_ROOT:-}"
+fi
+
 # ── Skippable storage engines ────────────────────────────────────────────────
 # These are MariaDB storage engines that can safely be disabled to save build
 # time and reduce compiler warnings.  InnoDB, Aria, MyISAM, and CSV are NOT
@@ -248,42 +258,97 @@ if [[ -z "$MARIADB_VERSION" ]]; then
     MARIADB_VERSION="$(get_latest_mariadb_version)"
 fi
 
-# ── Print configuration ────────────────────────────────────────────────────
-_cfg_row() {
-    local text="$1"
-    local plain
-    plain="$(echo -e "$text" | sed 's/\x1b\[[0-9;]*m//g')"
-    local len=${#plain}
-    local pad=$((66 - len))
-    if (( pad < 0 )); then pad=0; fi
-    printf "${CYAN}║${NC} %b%*s ${CYAN}║${NC}\n" "$text" "$pad" ""
+# ── Auto-sizing box drawing ───────────────────────────────────────────────
+# Usage:
+#   draw_box <border_color> <title> <array_varname>
+# where <array_varname> is the name of a bash array holding the body lines.
+# The box auto-sizes to fit the widest visible line (ANSI codes stripped).
+_strip_ansi() { echo -e "$1" | sed 's/\x1b\[[0-9;]*m//g'; }
+
+draw_box() {
+    local color="$1" title="$2" arr_name="$3"
+    local -n _lines="${arr_name}"
+
+    # Measure the widest visible line (title + all body lines)
+    local max_w=0 plain
+    plain="$(_strip_ansi "$title")"
+    (( ${#plain} > max_w )) && max_w=${#plain}
+    for line in "${_lines[@]}"; do
+        plain="$(_strip_ansi "$line")"
+        (( ${#plain} > max_w )) && max_w=${#plain}
+    done
+
+    # Box inner width = max visible line + 2 (1 space padding each side)
+    local W=$max_w
+    local border
+    border="$(printf '═%.0s' $(seq 1 $((W + 2))))"
+
+    _box_row() {
+        local text="$1"
+        plain="$(_strip_ansi "$text")"
+        local pad=$(( W - ${#plain} ))
+        (( pad < 0 )) && pad=0
+        printf "${color}║${NC} %b%*s ${color}║${NC}\n" "$text" "$pad" ""
+    }
+
+    echo ""
+    echo -e "${color}╔${border}╗${NC}"
+    _box_row "${color}${title}${NC}"
+    echo -e "${color}╠${border}╣${NC}"
+    for line in "${_lines[@]}"; do
+        _box_row "$line"
+    done
+    echo -e "${color}╚${border}╝${NC}"
+    echo ""
 }
 
-echo ""
-echo -e "${CYAN}╔$(printf '═%.0s' $(seq 1 68))╗${NC}"
-_cfg_row "${CYAN}TIDESQL Installer${NC}"
-echo -e "${CYAN}╠$(printf '═%.0s' $(seq 1 68))╣${NC}"
-_cfg_row "TidesDB version  : ${GREEN}${TIDESDB_VERSION}${NC}"
-_cfg_row "MariaDB version  : ${GREEN}${MARIADB_VERSION}${NC}"
-_cfg_row "TidesDB prefix   : ${GREEN}${TIDESDB_PREFIX}${NC}"
-_cfg_row "MariaDB prefix   : ${GREEN}${MARIADB_PREFIX}${NC}"
-_cfg_row "Build directory  : ${GREEN}${BUILD_DIR}${NC}"
-_cfg_row "Parallel jobs    : ${GREEN}${JOBS}${NC}"
-_cfg_row "Detected OS      : ${GREEN}${OS}${NC}"
-_cfg_row "PGO build        : ${GREEN}${PGO_ENABLED}${NC}"
+# ── Print configuration ────────────────────────────────────────────────────
+_cfg_lines=(
+    "TidesDB version  : ${GREEN}${TIDESDB_VERSION}${NC}"
+    "MariaDB version  : ${GREEN}${MARIADB_VERSION}${NC}"
+    "TidesDB prefix   : ${GREEN}${TIDESDB_PREFIX}${NC}"
+    "MariaDB prefix   : ${GREEN}${MARIADB_PREFIX}${NC}"
+    "Build directory  : ${GREEN}${BUILD_DIR}${NC}"
+    "Parallel jobs    : ${GREEN}${JOBS}${NC}"
+    "Detected OS      : ${GREEN}${OS}${NC}"
+    "PGO build        : ${GREEN}${PGO_ENABLED}${NC}"
+)
 if [[ -n "$SKIP_ENGINES" ]]; then
-_cfg_row "Skip engines     : ${YELLOW}${SKIP_ENGINES}${NC}"
+    _cfg_lines+=("Skip engines     : ${YELLOW}${SKIP_ENGINES}${NC}")
 fi
-_cfg_row "TideSQL repo     : ${GREEN}${SCRIPT_DIR}${NC}"
-echo -e "${CYAN}╚$(printf '═%.0s' $(seq 1 68))╝${NC}"
-echo ""
+_cfg_lines+=("TideSQL repo     : ${GREEN}${SCRIPT_DIR}${NC}")
 
-# ── Privilege helper (sudo on Unix, direct on Windows) ──────────────────────
+draw_box "${CYAN}" "TIDESQL Installer" _cfg_lines
+
+# ── Privilege helper (sudo on Unix only when needed, direct on Windows) ──────
+# Uses sudo only when the target prefix directory is not writable by the
+# current user, avoiding root-owned files in user-writable prefixes.
+_needs_sudo() {
+    local dir="$1"
+    # Walk up to find the first existing ancestor
+    while [[ ! -d "$dir" ]]; do
+        dir="$(dirname "$dir")"
+    done
+    [[ ! -w "$dir" ]]
+}
+
 run_privileged() {
     if [[ "$OS" == "windows" ]]; then
         "$@"
-    else
+    elif _needs_sudo "${MARIADB_PREFIX}"; then
         sudo "$@"
+    else
+        "$@"
+    fi
+}
+
+run_privileged_tidesdb() {
+    if [[ "$OS" == "windows" ]]; then
+        "$@"
+    elif _needs_sudo "${TIDESDB_PREFIX}"; then
+        sudo "$@"
+    else
+        "$@"
     fi
 }
 
@@ -330,15 +395,10 @@ install_deps() {
             ;;
         windows)
             if [[ -z "${VCPKG_ROOT:-}" ]]; then
-                if [[ -d "C:/vcpkg" ]]; then
-                    VCPKG_ROOT="C:/vcpkg"
-                else
-                    die "vcpkg not found. Set VCPKG_ROOT or install to C:/vcpkg.\n" \
-                        "  git clone https://github.com/Microsoft/vcpkg.git C:/vcpkg\n" \
-                        "  C:/vcpkg/bootstrap-vcpkg.bat"
-                fi
+                die "vcpkg not found. Set VCPKG_ROOT or install to C:/vcpkg.\n" \
+                    "  git clone https://github.com/Microsoft/vcpkg.git C:/vcpkg\n" \
+                    "  C:/vcpkg/bootstrap-vcpkg.bat"
             fi
-            export VCPKG_ROOT
 
             info "Installing vcpkg packages..."
             "${VCPKG_ROOT}/vcpkg.exe" install \
@@ -404,6 +464,8 @@ build_tidesdb() {
         -B "${tidesdb_src}/build"
         -DCMAKE_BUILD_TYPE=Release
         -DCMAKE_INSTALL_PREFIX="${TIDESDB_PREFIX}"
+        -DTIDESDB_BUILD_TESTS=OFF
+        -DBUILD_SHARED_LIBS=ON
     )
 
     case "$OS" in
@@ -422,7 +484,7 @@ build_tidesdb() {
 
     cmake "${cmake_args[@]}"
     cmake --build "${tidesdb_src}/build" --config Release --parallel "${JOBS}"
-    run_privileged cmake --install "${tidesdb_src}/build" --config Release
+    run_privileged_tidesdb cmake --install "${tidesdb_src}/build" --config Release
 
     # Update shared library cache on Linux
     case "$OS" in
@@ -449,7 +511,7 @@ prepare_mariadb() {
         https://github.com/MariaDB/server.git "${mariadb_src}"
 
     info "Initializing MariaDB submodules..."
-    (cd "${mariadb_src}" && git submodule update --init --recursive)
+    (cd "${mariadb_src}" && git submodule update --init --recursive --force)
 
     info "Copying TidesDB storage engine plugin into MariaDB source..."
     cp -r "${SCRIPT_DIR}/tidesdb" "${mariadb_src}/storage/"
@@ -474,11 +536,10 @@ build_mariadb() {
         -B "${mariadb_build}"
         -DCMAKE_INSTALL_PREFIX="${MARIADB_PREFIX}"
         -DCMAKE_BUILD_TYPE=RelWithDebInfo
-        -DCMAKE_PREFIX_PATH="${TIDESDB_PREFIX}"
     )
 
     # Hint so the TidesDB plugin's FIND_LIBRARY / FIND_PATH succeed
-    cmake_args+=(-DTIDESDB_ROOT="${TIDESDB_PREFIX}")
+    # (CMakeLists.txt uses ENV TIDESDB_ROOT in HINTS)
     export TIDESDB_ROOT="${TIDESDB_PREFIX}"
 
     # Ensure full server with all standard features
@@ -508,6 +569,7 @@ build_mariadb() {
             [[ -n "$cxx" ]]      && cmake_args+=(-DCMAKE_CXX_COMPILER="${cxx}")
             [[ -n "$sdk_root" ]] && cmake_args+=(-DCMAKE_OSX_SYSROOT="${sdk_root}")
             cmake_args+=(
+                -DCMAKE_PREFIX_PATH="${TIDESDB_PREFIX}"
                 "-DCMAKE_C_FLAGS=-Wno-nullability-completeness"
                 "-DCMAKE_CXX_FLAGS=-Wno-nullability-completeness"
                 -DWITH_SSL=bundled
@@ -520,6 +582,9 @@ build_mariadb() {
                 -G "Visual Studio 17 2022" -A x64
                 "-DCMAKE_PREFIX_PATH=${TIDESDB_PREFIX};${VCPKG_ROOT}/installed/x64-windows"
             )
+            ;;
+        *)
+            cmake_args+=(-DCMAKE_PREFIX_PATH="${TIDESDB_PREFIX}")
             ;;
     esac
 
@@ -547,12 +612,23 @@ install_mariadb() {
 setup_mariadb() {
     local datadir="${MARIADB_PREFIX}/data"
 
-    # Ensure mysql user exists on Unix
-    if [[ "$OS" != "windows" ]]; then
+    # Determine whether this is a system-level install (needs root/mysql user)
+    # or a user-local install (run everything as current user).
+    local use_mysql_user=false
+    if [[ "$OS" != "windows" ]] && _needs_sudo "${MARIADB_PREFIX}"; then
+        use_mysql_user=true
+        # Ensure mysql user exists
         if ! id -u mysql &>/dev/null; then
             info "Creating mysql system user..."
             sudo useradd -r -s /bin/false -d "${datadir}" mysql 2>/dev/null || true
         fi
+    fi
+
+    local run_user
+    if $use_mysql_user; then
+        run_user="mysql"
+    else
+        run_user="$(id -un)"
     fi
 
     # Write config before init so mariadb-install-db can pick it up
@@ -564,11 +640,15 @@ setup_mariadb() {
     if [[ ! -f "${cnf_file}" ]]; then
         info "Creating MariaDB configuration at ${cnf_file}..."
 
-        local socket_line="" client_socket="" socket_path=""
-        if [[ "$OS" != "windows" ]]; then
+        local socket_line="" client_socket="" socket_path="" plugin_ext="so"
+        local user_line=""
+        if [[ "$OS" == "windows" ]]; then
+            plugin_ext="dll"
+        else
             socket_path="/tmp/mariadb.sock"
             socket_line="socket  = ${socket_path}"
             client_socket="socket = ${socket_path}"
+            user_line="user    = ${run_user}"
         fi
 
         local cnf_content
@@ -577,6 +657,7 @@ basedir = ${MARIADB_PREFIX}
 datadir = ${datadir}
 port    = 3306
 ${socket_line}
+${user_line}
 pid-file = ${datadir}/mariadb.pid
 log-error = ${datadir}/mariadb.err
 
@@ -591,10 +672,6 @@ innodb_log_file_size = 48M
 innodb_flush_log_at_trx_commit = 1
 innodb_file_per_table = ON
 
-# Query cache (disabled by default in modern MariaDB, kept explicit)
-query_cache_type = 0
-query_cache_size = 0
-
 # Logging
 slow_query_log = ON
 slow_query_log_file = ${datadir}/slow.log
@@ -606,7 +683,7 @@ collation-server = utf8mb4_general_ci
 
 # TidesDB plugin — loaded at startup
 plugin_maturity = experimental
-plugin_load_add = ha_tidesdb.so
+plugin_load_add = ha_tidesdb.${plugin_ext}
 
 # TidesDB settings (defaults shown — tune as needed)
 tidesdb_flush_threads = 2
@@ -614,7 +691,6 @@ tidesdb_compaction_threads = 2
 tidesdb_block_cache_size = 268435456
 tidesdb_max_open_sstables = 256
 tidesdb_log_level = WARN
-tidesdb_debug_trace = OFF
 
 [client]
 port = 3306
@@ -632,8 +708,12 @@ max_allowed_packet = 64M
             mkdir -p "$(dirname "${cnf_file}")"
             echo "$cnf_content" > "${cnf_file}"
         else
-            sudo mkdir -p "$(dirname "${cnf_file}")"
-            echo "$cnf_content" | sudo tee "${cnf_file}" > /dev/null
+            run_privileged mkdir -p "$(dirname "${cnf_file}")"
+            if $use_mysql_user; then
+                echo "$cnf_content" | sudo tee "${cnf_file}" > /dev/null
+            else
+                echo "$cnf_content" > "${cnf_file}"
+            fi
         fi
         ok "Configuration written to ${cnf_file}"
     else
@@ -662,21 +742,28 @@ max_allowed_packet = 64M
     else
         if [[ "$OS" == "windows" ]]; then
             "${install_db}" \
+                --defaults-file="${cnf_file}" \
                 --basedir="${MARIADB_PREFIX}" \
                 --datadir="${datadir}" 2>&1 || true
-        else
+        elif $use_mysql_user; then
             sudo "${install_db}" \
+                --defaults-file="${cnf_file}" \
                 --user=mysql \
                 --basedir="${MARIADB_PREFIX}" \
                 --datadir="${datadir}" 2>&1 || true
-
             sudo chown -R mysql:mysql "${datadir}"
+        else
+            "${install_db}" \
+                --defaults-file="${cnf_file}" \
+                --user="${run_user}" \
+                --basedir="${MARIADB_PREFIX}" \
+                --datadir="${datadir}" 2>&1 || true
         fi
         ok "Data directory initialized"
     fi
 
-    # Set proper ownership on Unix
-    if [[ "$OS" != "windows" && -d "${datadir}" ]]; then
+    # Set proper ownership on Unix (only needed for system-level installs)
+    if $use_mysql_user && [[ -d "${datadir}" ]]; then
         sudo chown -R mysql:mysql "${datadir}"
     fi
 }
@@ -684,66 +771,58 @@ max_allowed_packet = 64M
 print_summary() {
     local cnf_name="my.cnf"
     local start_cmd="${MARIADB_PREFIX}/bin/mariadbd-safe"
-    local connect_cmd="${MARIADB_PREFIX}/bin/mariadb -u root"
     local test_dir="${BUILD_DIR}/mariadb-server/build/mysql-test"
+
+    # Use the correct connect user: root for system installs, current user otherwise
+    local connect_user="root"
+    if [[ "$OS" != "windows" ]] && ! _needs_sudo "${MARIADB_PREFIX}"; then
+        connect_user="$(id -un)"
+    fi
+    local connect_cmd="${MARIADB_PREFIX}/bin/mariadb -u ${connect_user}"
 
     if [[ "$OS" == "windows" ]]; then
         cnf_name="my.ini"
         start_cmd="${MARIADB_PREFIX}/bin/mysqld.exe"
     fi
 
-    local W=66  # inner width between ║ and ║
-
-    # Print a row, colored ║, padded content, colored ║
-    row() {
-        local text="$1"
-        local plain
-        # Strip ANSI escape sequences to measure visible length
-        plain="$(echo -e "$text" | sed 's/\x1b\[[0-9;]*m//g')"
-        local len=${#plain}
-        local pad=$((W - len))
-        if (( pad < 0 )); then pad=0; fi
-        printf "${GREEN}║${NC} %b%*s ${GREEN}║${NC}\n" "$text" "$pad" ""
-    }
-
-    echo ""
-    echo -e "${GREEN}╔$(printf '═%.0s' $(seq 1 $((W + 2))))╗${NC}"
-    row "${GREEN}Installation Complete!${NC}"
-    echo -e "${GREEN}╠$(printf '═%.0s' $(seq 1 $((W + 2))))╣${NC}"
-    row ""
-    row "TidesDB installed to : ${CYAN}${TIDESDB_PREFIX}${NC}"
-    row "MariaDB installed to : ${CYAN}${MARIADB_PREFIX}${NC}"
+    local _summary_lines=(
+        ""
+        "TidesDB installed to : ${CYAN}${TIDESDB_PREFIX}${NC}"
+        "MariaDB installed to : ${CYAN}${MARIADB_PREFIX}${NC}"
+    )
     if $PGO_ENABLED; then
-        row "Build type           : ${CYAN}Release + PGO${NC}"
+        _summary_lines+=("Build type           : ${CYAN}Release + PGO${NC}")
     fi
-    row ""
-    row "Start MariaDB:"
-    row "  ${start_cmd} \\"
-    row "    --defaults-file=${MARIADB_PREFIX}/${cnf_name} &"
-    row ""
-    row "Connect:"
-    row "  ${connect_cmd}"
-    row ""
-    row "Verify TidesDB plugin:"
-    row "  SHOW PLUGINS;"
-    row "  -- or if not auto-loaded:"
-    row "  INSTALL SONAME 'ha_tidesdb';"
-    row ""
-    row "Quick test:"
-    row "  CREATE TABLE t (id INT PRIMARY KEY) ENGINE=TIDESDB;"
-    row "  INSERT INTO t VALUES (1), (2), (3);"
-    row "  SELECT * FROM t;"
-    row "  DROP TABLE t;"
-    row ""
-    row "Run TidesDB test suite:"
-    row "  cd ${test_dir}"
-    row "  perl mtr --suite=tidesdb --parallel=4"
-    row ""
-    row "Add to PATH (optional):"
-    row "  export PATH=\"${MARIADB_PREFIX}/bin:\$PATH\""
-    row ""
-    echo -e "${GREEN}╚$(printf '═%.0s' $(seq 1 $((W + 2))))╝${NC}"
-    echo ""
+    _summary_lines+=(
+        ""
+        "Start MariaDB:"
+        "  ${start_cmd} \\"
+        "    --defaults-file=${MARIADB_PREFIX}/${cnf_name} &"
+        ""
+        "Connect:"
+        "  ${connect_cmd}"
+        ""
+        "Verify TidesDB plugin:"
+        "  SHOW PLUGINS;"
+        "  -- or if not auto-loaded:"
+        "  INSTALL SONAME 'ha_tidesdb';"
+        ""
+        "Quick test:"
+        "  CREATE TABLE t (id INT PRIMARY KEY) ENGINE=TIDESDB;"
+        "  INSERT INTO t VALUES (1), (2), (3);"
+        "  SELECT * FROM t;"
+        "  DROP TABLE t;"
+        ""
+        "Run TidesDB test suite:"
+        "  cd ${test_dir}"
+        "  perl mtr --suite=tidesdb --parallel=4"
+        ""
+        "Add to PATH (optional):"
+        "  export PATH=\"${MARIADB_PREFIX}/bin:\$PATH\""
+        ""
+    )
+
+    draw_box "${GREEN}" "Installation Complete!" _summary_lines
 }
 
 # ── PGO Phase 1 —— Instrument build ─────────────────────────────────
@@ -759,20 +838,15 @@ pgo_instrument() {
     rm -rf "${mariadb_build}"
     mkdir -p "${mariadb_build}"
 
+    local profraw="${profile_dir}/default-%m.profraw"
+
     local cmake_args=(
         -S "${mariadb_src}"
         -B "${mariadb_build}"
         -DCMAKE_INSTALL_PREFIX="${MARIADB_PREFIX}"
         -DCMAKE_BUILD_TYPE=Release
-        -DCMAKE_PREFIX_PATH="${TIDESDB_PREFIX}"
-        -DTIDESDB_ROOT="${TIDESDB_PREFIX}"
         -DWITH_MARIABACKUP=ON
         -DWITH_UNIT_TESTS=OFF
-        "-DCMAKE_C_FLAGS=-fprofile-generate=${profile_dir} -fprofile-update=atomic"
-        "-DCMAKE_CXX_FLAGS=-fprofile-generate=${profile_dir} -fprofile-update=atomic"
-        "-DCMAKE_EXE_LINKER_FLAGS=-fprofile-generate=${profile_dir}"
-        "-DCMAKE_SHARED_LINKER_FLAGS=-fprofile-generate=${profile_dir}"
-        "-DCMAKE_MODULE_LINKER_FLAGS=-fprofile-generate=${profile_dir}"
     )
 
     export TIDESDB_ROOT="${TIDESDB_PREFIX}"
@@ -797,9 +871,32 @@ pgo_instrument() {
             [[ -n "$cxx" ]]      && cmake_args+=(-DCMAKE_CXX_COMPILER="${cxx}")
             [[ -n "$sdk_root" ]] && cmake_args+=(-DCMAKE_OSX_SYSROOT="${sdk_root}")
             cmake_args+=(
+                -DCMAKE_PREFIX_PATH="${TIDESDB_PREFIX}"
+                "-DCMAKE_C_FLAGS=-fprofile-instr-generate=${profraw} -Wno-nullability-completeness"
+                "-DCMAKE_CXX_FLAGS=-fprofile-instr-generate=${profraw} -Wno-nullability-completeness"
+                "-DCMAKE_EXE_LINKER_FLAGS=-fprofile-instr-generate"
+                "-DCMAKE_SHARED_LINKER_FLAGS=-fprofile-instr-generate"
+                "-DCMAKE_MODULE_LINKER_FLAGS=-fprofile-instr-generate"
                 -DWITH_SSL=bundled
                 -DWITH_PCRE=bundled
                 -G Ninja
+            )
+            ;;
+        windows)
+            cmake_args+=(
+                -G "Visual Studio 17 2022" -A x64
+                "-DCMAKE_PREFIX_PATH=${TIDESDB_PREFIX};${VCPKG_ROOT}/installed/x64-windows"
+            )
+            warn "PGO is not supported on Windows (MSVC); falling back to normal Release build"
+            ;;
+        *)
+            cmake_args+=(
+                -DCMAKE_PREFIX_PATH="${TIDESDB_PREFIX}"
+                "-DCMAKE_C_FLAGS=-fprofile-generate=${profile_dir} -fprofile-update=atomic"
+                "-DCMAKE_CXX_FLAGS=-fprofile-generate=${profile_dir} -fprofile-update=atomic"
+                "-DCMAKE_EXE_LINKER_FLAGS=-fprofile-generate=${profile_dir}"
+                "-DCMAKE_SHARED_LINKER_FLAGS=-fprofile-generate=${profile_dir}"
+                "-DCMAKE_MODULE_LINKER_FLAGS=-fprofile-generate=${profile_dir}"
             )
             ;;
     esac
@@ -829,11 +926,23 @@ pgo_train() {
     ) || warn "Some MTR tests may have failed during PGO training (non-fatal)"
 
     local profile_dir="${BUILD_DIR}/pgo-profiles"
-    local profile_count
-    profile_count="$(find "${profile_dir}" -name '*.gcda' 2>/dev/null | wc -l)"
+    local profile_count=0
 
-    if [[ "${profile_count}" -eq 0 ]]; then
-        die "No profile data generated in ${profile_dir} — PGO training failed"
+    if [[ "$OS" == "macos" ]]; then
+        # Clang generates .profraw files; merge them into a single .profdata
+        profile_count="$(find "${profile_dir}" -name '*.profraw' 2>/dev/null | wc -l)"
+        if [[ "${profile_count}" -eq 0 ]]; then
+            die "No profile data generated in ${profile_dir} — PGO training failed"
+        fi
+        info "Merging ${profile_count} .profraw files..."
+        xcrun llvm-profdata merge -output="${profile_dir}/default.profdata" \
+            "${profile_dir}"/*.profraw
+    else
+        # GCC generates .gcda files
+        profile_count="$(find "${profile_dir}" -name '*.gcda' 2>/dev/null | wc -l)"
+        if [[ "${profile_count}" -eq 0 ]]; then
+            die "No profile data generated in ${profile_dir} — PGO training failed"
+        fi
     fi
 
     ok "PGO Phase 2/3: Training complete (${profile_count} profile files generated)"
@@ -851,20 +960,15 @@ pgo_optimize() {
     rm -rf "${mariadb_build}"
     mkdir -p "${mariadb_build}"
 
+    local profdata="${profile_dir}/default.profdata"
+
     local cmake_args=(
         -S "${mariadb_src}"
         -B "${mariadb_build}"
         -DCMAKE_INSTALL_PREFIX="${MARIADB_PREFIX}"
         -DCMAKE_BUILD_TYPE=Release
-        -DCMAKE_PREFIX_PATH="${TIDESDB_PREFIX}"
-        -DTIDESDB_ROOT="${TIDESDB_PREFIX}"
         -DWITH_MARIABACKUP=ON
         -DWITH_UNIT_TESTS=OFF
-        "-DCMAKE_C_FLAGS=-fprofile-use=${profile_dir} -fprofile-correction"
-        "-DCMAKE_CXX_FLAGS=-fprofile-use=${profile_dir} -fprofile-correction"
-        "-DCMAKE_EXE_LINKER_FLAGS=-fprofile-use=${profile_dir}"
-        "-DCMAKE_SHARED_LINKER_FLAGS=-fprofile-use=${profile_dir}"
-        "-DCMAKE_MODULE_LINKER_FLAGS=-fprofile-use=${profile_dir}"
     )
 
     export TIDESDB_ROOT="${TIDESDB_PREFIX}"
@@ -889,9 +993,28 @@ pgo_optimize() {
             [[ -n "$cxx" ]]      && cmake_args+=(-DCMAKE_CXX_COMPILER="${cxx}")
             [[ -n "$sdk_root" ]] && cmake_args+=(-DCMAKE_OSX_SYSROOT="${sdk_root}")
             cmake_args+=(
+                -DCMAKE_PREFIX_PATH="${TIDESDB_PREFIX}"
+                "-DCMAKE_C_FLAGS=-fprofile-instr-use=${profdata} -Wno-nullability-completeness"
+                "-DCMAKE_CXX_FLAGS=-fprofile-instr-use=${profdata} -Wno-nullability-completeness"
                 -DWITH_SSL=bundled
                 -DWITH_PCRE=bundled
                 -G Ninja
+            )
+            ;;
+        windows)
+            cmake_args+=(
+                -G "Visual Studio 17 2022" -A x64
+                "-DCMAKE_PREFIX_PATH=${TIDESDB_PREFIX};${VCPKG_ROOT}/installed/x64-windows"
+            )
+            ;;
+        *)
+            cmake_args+=(
+                -DCMAKE_PREFIX_PATH="${TIDESDB_PREFIX}"
+                "-DCMAKE_C_FLAGS=-fprofile-use=${profile_dir} -fprofile-correction"
+                "-DCMAKE_CXX_FLAGS=-fprofile-use=${profile_dir} -fprofile-correction"
+                "-DCMAKE_EXE_LINKER_FLAGS=-fprofile-use=${profile_dir}"
+                "-DCMAKE_SHARED_LINKER_FLAGS=-fprofile-use=${profile_dir}"
+                "-DCMAKE_MODULE_LINKER_FLAGS=-fprofile-use=${profile_dir}"
             )
             ;;
     esac

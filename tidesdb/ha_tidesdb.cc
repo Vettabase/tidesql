@@ -4863,8 +4863,8 @@ maria_declare_plugin(tidesdb){
     PLUGIN_LICENSE_GPL,
     tidesdb_init_func,
     tidesdb_deinit_func,
-    0x30400,
+    0x30401,
     NULL,
     tidesdb_system_variables,
-    "3.4.0",
+    "3.4.1",
     MariaDB_PLUGIN_MATURITY_EXPERIMENTAL} maria_declare_plugin_end;
