@@ -1,0 +1,144 @@
+FROM ubuntu:24.04
+
+# ── Build-time arguments ────────────────────────────────────────────────────
+# Override with --build-arg KEY=VALUE at docker build time.
+ARG MARIADB_VERSION=11.8
+ARG TIDESDB_VERSION=v8.6.1
+ARG TIDESDB_PREFIX=/usr/local
+ARG MARIADB_PREFIX=/usr/local/mariadb
+
+# Persist key paths as environment variables so they are available in every
+# RUN step and at container runtime.
+ENV TIDESDB_PREFIX=${TIDESDB_PREFIX} \
+    MARIADB_PREFIX=${MARIADB_PREFIX} \
+    DEBIAN_FRONTEND=noninteractive
+ENV PATH="${MARIADB_PREFIX}/bin:${PATH}"
+
+# ── 1. Install system dependencies ─────────────────────────────────────────
+# Mirrors the debian/ubuntu branch of install_deps() in install.sh.
+RUN apt-get update -qq && \
+    apt-get install -y -qq \
+        build-essential cmake ninja-build bison flex \
+        libzstd-dev liblz4-dev libsnappy-dev \
+        libncurses-dev libssl-dev libxml2-dev \
+        libevent-dev libcurl4-openssl-dev \
+        pkg-config git gnutls-dev && \
+    rm -rf /var/lib/apt/lists/*
+
+# ── 2. Copy TidesDB storage engine plugin and test suite from this repo ────
+# The build context must be the repository root (see docker/README).
+COPY tidesdb                        /opt/tidesql/tidesdb
+COPY mysql-test/suite/tidesdb       /opt/tidesql/mysql-test/suite/tidesdb
+
+# ── 3. Build and install TidesDB library ───────────────────────────────────
+# Mirrors build_tidesdb() in install.sh.
+RUN git clone --depth 1 --branch "${TIDESDB_VERSION}" \
+        https://github.com/tidesdb/tidesdb.git /tmp/tidesql-build/tidesdb-lib && \
+    cmake \
+        -S /tmp/tidesql-build/tidesdb-lib \
+        -B /tmp/tidesql-build/tidesdb-lib/build \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_INSTALL_PREFIX="${TIDESDB_PREFIX}" \
+        -DTIDESDB_BUILD_TESTS=OFF \
+        -DBUILD_SHARED_LIBS=ON && \
+    cmake --build /tmp/tidesql-build/tidesdb-lib/build \
+        --config Release --parallel "$(nproc)" && \
+    cmake --install /tmp/tidesql-build/tidesdb-lib/build --config Release && \
+    ldconfig && \
+    rm -rf /tmp/tidesql-build/tidesdb-lib
+
+# ── 4. Clone MariaDB source and inject TidesDB storage engine plugin ────────
+# Mirrors prepare_mariadb() in install.sh.
+RUN git clone --depth 1 --branch "${MARIADB_VERSION}" \
+        https://github.com/MariaDB/server.git /tmp/tidesql-build/mariadb-server && \
+    cd /tmp/tidesql-build/mariadb-server && \
+    git submodule update --init --recursive --force && \
+    cp -r /opt/tidesql/tidesdb storage/ && \
+    cp -r /opt/tidesql/mysql-test/suite/tidesdb mysql-test/suite/
+
+# ── 5. Configure, build, and install MariaDB ───────────────────────────────
+# Mirrors build_mariadb() + install_mariadb() in install.sh.
+RUN export TIDESDB_ROOT="${TIDESDB_PREFIX}" && \
+    cmake \
+        -S /tmp/tidesql-build/mariadb-server \
+        -B /tmp/tidesql-build/mariadb-server/build \
+        -DCMAKE_INSTALL_PREFIX="${MARIADB_PREFIX}" \
+        -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+        -DWITH_MARIABACKUP=ON \
+        -DWITH_UNIT_TESTS=OFF \
+        -DCMAKE_PREFIX_PATH="${TIDESDB_PREFIX}" && \
+    cmake --build /tmp/tidesql-build/mariadb-server/build \
+        --config RelWithDebInfo --parallel "$(nproc)" && \
+    cmake --install /tmp/tidesql-build/mariadb-server/build \
+        --config RelWithDebInfo && \
+    rm -rf /tmp/tidesql-build
+
+# ── 6. Create mysql system user and write MariaDB configuration ─────────────
+# Mirrors setup_mariadb() in install.sh (config section).
+# bind-address is set to 0.0.0.0 so the port is reachable from the Docker host.
+RUN useradd -r -s /bin/false -d "${MARIADB_PREFIX}/data" mysql && \
+    mkdir -p "${MARIADB_PREFIX}/data" && \
+    { \
+      echo "[mysqld]"; \
+      echo "basedir  = ${MARIADB_PREFIX}"; \
+      echo "datadir  = ${MARIADB_PREFIX}/data"; \
+      echo "port     = 3306"; \
+      echo "socket   = /tmp/mariadb.sock"; \
+      echo "user     = mysql"; \
+      echo "pid-file = ${MARIADB_PREFIX}/data/mariadb.pid"; \
+      echo "log-error = ${MARIADB_PREFIX}/data/mariadb.err"; \
+      echo ""; \
+      echo "# Networking"; \
+      echo "bind-address    = 0.0.0.0"; \
+      echo "max_connections = 151"; \
+      echo ""; \
+      echo "# InnoDB"; \
+      echo "default_storage_engine        = InnoDB"; \
+      echo "innodb_buffer_pool_size       = 128M"; \
+      echo "innodb_log_file_size          = 48M"; \
+      echo "innodb_flush_log_at_trx_commit = 1"; \
+      echo "innodb_file_per_table         = ON"; \
+      echo ""; \
+      echo "# Logging"; \
+      echo "slow_query_log      = ON"; \
+      echo "slow_query_log_file = ${MARIADB_PREFIX}/data/slow.log"; \
+      echo "long_query_time     = 2"; \
+      echo ""; \
+      echo "# Character set"; \
+      echo "character-set-server = utf8mb4"; \
+      echo "collation-server     = utf8mb4_general_ci"; \
+      echo ""; \
+      echo "# TidesDB plugin — loaded at startup"; \
+      echo "plugin_maturity  = experimental"; \
+      echo "plugin_load_add  = ha_tidesdb.so"; \
+      echo ""; \
+      echo "# TidesDB settings (defaults shown — tune as needed)"; \
+      echo "tidesdb_flush_threads      = 2"; \
+      echo "tidesdb_compaction_threads = 2"; \
+      echo "tidesdb_block_cache_size   = 268435456"; \
+      echo "tidesdb_max_open_sstables  = 256"; \
+      echo "tidesdb_log_level          = WARN"; \
+      echo ""; \
+      echo "[client]"; \
+      echo "port                  = 3306"; \
+      echo "socket                = /tmp/mariadb.sock"; \
+      echo "default-character-set = utf8mb4"; \
+      echo ""; \
+      echo "[mysqldump]"; \
+      echo "quick"; \
+      echo "max_allowed_packet = 64M"; \
+      echo ""; \
+      echo "[mariadb-backup]"; \
+      echo "# mariabackup settings (defaults are fine)"; \
+    } > "${MARIADB_PREFIX}/my.cnf"
+
+# ── 7. Install entrypoint ──────────────────────────────────────────────────
+COPY docker/11.8-ubuntu/entrypoint.sh /usr/local/bin/tidesql-entrypoint.sh
+RUN chmod +x /usr/local/bin/tidesql-entrypoint.sh
+
+# Data directory is a named / bind-mount target for persistence
+VOLUME ${MARIADB_PREFIX}/data
+
+EXPOSE 3306
+
+ENTRYPOINT ["/usr/local/bin/tidesql-entrypoint.sh"]
