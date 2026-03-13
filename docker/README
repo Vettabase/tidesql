@@ -17,6 +17,7 @@ PREREQUISITES
 ░░░░░░░░░░░░░░░░░░░░░░░░
 
   - Docker 20.10 or later (BuildKit enabled by default from Docker 23+)
+    OR Podman 4.0 or later (see PODMAN section below)
   - An internet connection at build time to clone MariaDB and TidesDB sources
     from GitHub
 
@@ -44,33 +45,50 @@ BUILD ARGUMENTS
 Override any of the following defaults with --build-arg KEY=VALUE:
 
   MARIADB_VERSION   MariaDB branch or tag to build   (default: 11.8)
-  TIDESDB_VERSION   TidesDB release tag to build      (default: v8.6.1)
+  TIDESDB_VERSION   TidesDB release tag to build      (default: 8.8.0)
   TIDESDB_PREFIX    TidesDB install prefix            (default: /usr/local)
   MARIADB_PREFIX    MariaDB install prefix            (default: /usr/local/mariadb)
+  WITH_TESTS        Include test suite in image (1=yes, 0=no, default: 0)
 
-Example — pin a specific TidesDB release:
+When WITH_TESTS=0 (default) the MariaDB mysql-test/ directory and the TidesDB
+test suite are removed from the final image, reducing its size.  Set
+WITH_TESTS=1 to keep them for development or CI use.
+
+Example — include the test suite:
 
   docker build \
       -f docker/11.8-ubuntu/Dockerfile \
-      --build-arg TIDESDB_VERSION=v8.6.1 \
-      -t tidesql:11.8-ubuntu \
+      --build-arg WITH_TESTS=1 \
+      -t tidesql:11.8-ubuntu-tests \
       .
 
 
 RUNNING A CONTAINER
 ░░░░░░░░░░░░░░░░░░░░░░░░
 
-Start a container with a named volume so data persists across restarts:
+Start a container with named volumes so data and configuration persist across
+restarts:
 
   docker run -d \
       --name tidesql \
       -p 3306:3306 \
+      -v tidesql-conf:/usr/local/mariadb/conf \
       -v tidesql-data:/usr/local/mariadb/data \
       tidesql:11.8-ubuntu
 
 On the first start the entrypoint initialises the data directory
 (mariadb-install-db) before launching the server.  Subsequent starts reuse
 the existing data directory.
+
+The conf volume is initialised from the my.cnf baked into the image.  Mount a
+host directory there to supply your own configuration:
+
+  docker run -d \
+      --name tidesql \
+      -p 3306:3306 \
+      -v /path/to/your/conf:/usr/local/mariadb/conf \
+      -v tidesql-data:/usr/local/mariadb/data \
+      tidesql:11.8-ubuntu
 
 Connect from the host:
 
@@ -102,11 +120,50 @@ If it is not loaded automatically:
 RUN TEST SUITE
 ░░░░░░░░░░░░░░░░░░░░░░░░
 
-The MariaDB test suite is built inside the image.  Run the TidesDB suite:
+Requires an image built with WITH_TESTS=1.  Run the TidesDB suite:
 
   docker exec -it tidesql bash -c \
       "cd /usr/local/mariadb/mysql-test && \
        perl mtr --suite=tidesdb --parallel=4 --force"
+
+
+PODMAN
+░░░░░░░░░░░░░░░░░░░░░░░░
+
+The images can be built and run with rootless Podman without any changes to
+the Dockerfile or entrypoint.  Podman's CLI is compatible with Docker for all
+operations used here.
+
+Build:
+
+  podman build \
+      -f docker/11.8-ubuntu/Dockerfile \
+      -t tidesql:11.8-ubuntu \
+      .
+
+Run:
+
+  podman run -d \
+      --name tidesql \
+      -p 3306:3306 \
+      -v tidesql-conf:/usr/local/mariadb/conf \
+      -v tidesql-data:/usr/local/mariadb/data \
+      tidesql:11.8-ubuntu
+
+Connect from the host:
+
+  mariadb -h 127.0.0.1 -P 3306 -u root
+
+Connect from inside the container:
+
+  podman exec -it tidesql \
+      mariadb --socket=/tmp/mariadb.sock -u root
+
+Stop and remove:
+
+  podman stop tidesql
+  podman rm   tidesql
+  podman volume rm tidesql-conf tidesql-data
 
 
 STOPPING AND REMOVING
@@ -114,4 +171,4 @@ STOPPING AND REMOVING
 
   docker stop tidesql
   docker rm   tidesql
-  docker volume rm tidesql-data   # removes persistent data — irreversible
+  docker volume rm tidesql-conf tidesql-data   # removes persistent data — irreversible
