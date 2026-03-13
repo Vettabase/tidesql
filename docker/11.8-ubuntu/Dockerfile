@@ -3,9 +3,11 @@ FROM ubuntu:24.04
 # ── Build-time arguments ────────────────────────────────────────────────────
 # Override with --build-arg KEY=VALUE at docker build time.
 ARG MARIADB_VERSION=11.8
-ARG TIDESDB_VERSION=v8.6.1
+ARG TIDESDB_VERSION=8.8.0
 ARG TIDESDB_PREFIX=/usr/local
 ARG MARIADB_PREFIX=/usr/local/mariadb
+# Set WITH_TESTS=1 to include the MariaDB + TidesDB test suite in the image.
+ARG WITH_TESTS=0
 
 # Persist key paths as environment variables so they are available in every
 # RUN step and at container runtime.
@@ -15,7 +17,6 @@ ENV TIDESDB_PREFIX=${TIDESDB_PREFIX} \
 ENV PATH="${MARIADB_PREFIX}/bin:${PATH}"
 
 # ── 1. Install system dependencies ─────────────────────────────────────────
-# Mirrors the debian/ubuntu branch of install_deps() in install.sh.
 RUN apt-get update -qq && \
     apt-get install -y -qq \
         build-essential cmake ninja-build bison flex \
@@ -31,7 +32,6 @@ COPY tidesdb                        /opt/tidesql/tidesdb
 COPY mysql-test/suite/tidesdb       /opt/tidesql/mysql-test/suite/tidesdb
 
 # ── 3. Build and install TidesDB library ───────────────────────────────────
-# Mirrors build_tidesdb() in install.sh.
 RUN git clone --depth 1 --branch "${TIDESDB_VERSION}" \
         https://github.com/tidesdb/tidesdb.git /tmp/tidesql-build/tidesdb-lib && \
     cmake \
@@ -48,16 +48,16 @@ RUN git clone --depth 1 --branch "${TIDESDB_VERSION}" \
     rm -rf /tmp/tidesql-build/tidesdb-lib
 
 # ── 4. Clone MariaDB source and inject TidesDB storage engine plugin ────────
-# Mirrors prepare_mariadb() in install.sh.
 RUN git clone --depth 1 --branch "${MARIADB_VERSION}" \
         https://github.com/MariaDB/server.git /tmp/tidesql-build/mariadb-server && \
     cd /tmp/tidesql-build/mariadb-server && \
     git submodule update --init --recursive --force && \
     cp -r /opt/tidesql/tidesdb storage/ && \
-    cp -r /opt/tidesql/mysql-test/suite/tidesdb mysql-test/suite/
+    if [ "${WITH_TESTS}" = "1" ]; then \
+        cp -r /opt/tidesql/mysql-test/suite/tidesdb mysql-test/suite/; \
+    fi
 
 # ── 5. Configure, build, and install MariaDB ───────────────────────────────
-# Mirrors build_mariadb() + install_mariadb() in install.sh.
 RUN export TIDESDB_ROOT="${TIDESDB_PREFIX}" && \
     cmake \
         -S /tmp/tidesql-build/mariadb-server \
@@ -71,13 +71,15 @@ RUN export TIDESDB_ROOT="${TIDESDB_PREFIX}" && \
         --config RelWithDebInfo --parallel "$(nproc)" && \
     cmake --install /tmp/tidesql-build/mariadb-server/build \
         --config RelWithDebInfo && \
+    if [ "${WITH_TESTS}" = "0" ]; then \
+        rm -rf "${MARIADB_PREFIX}/mysql-test" /opt/tidesql/mysql-test; \
+    fi && \
     rm -rf /tmp/tidesql-build
 
 # ── 6. Create mysql system user and write MariaDB configuration ─────────────
-# Mirrors setup_mariadb() in install.sh (config section).
 # bind-address is set to 0.0.0.0 so the port is reachable from the Docker host.
 RUN useradd -r -s /bin/false -d "${MARIADB_PREFIX}/data" mysql && \
-    mkdir -p "${MARIADB_PREFIX}/data" && \
+    mkdir -p "${MARIADB_PREFIX}/data" "${MARIADB_PREFIX}/conf" && \
     { \
       echo "[mysqld]"; \
       echo "basedir  = ${MARIADB_PREFIX}"; \
@@ -130,14 +132,14 @@ RUN useradd -r -s /bin/false -d "${MARIADB_PREFIX}/data" mysql && \
       echo ""; \
       echo "[mariadb-backup]"; \
       echo "# mariabackup settings (defaults are fine)"; \
-    } > "${MARIADB_PREFIX}/my.cnf"
+    } > "${MARIADB_PREFIX}/conf/my.cnf"
 
 # ── 7. Install entrypoint ──────────────────────────────────────────────────
 COPY docker/11.8-ubuntu/entrypoint.sh /usr/local/bin/tidesql-entrypoint.sh
 RUN chmod +x /usr/local/bin/tidesql-entrypoint.sh
 
-# Data directory is a named / bind-mount target for persistence
-VOLUME ${MARIADB_PREFIX}/data
+VOLUME /usr/local/mariadb/conf
+VOLUME /usr/local/mariadb/data
 
 EXPOSE 3306
 

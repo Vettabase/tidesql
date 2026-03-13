@@ -32,7 +32,7 @@ if [ ! -d "${DATADIR}/mysql" ]; then
     fi
 
     "${INSTALL_DB}" \
-        --defaults-file="${MARIADB_PREFIX}/my.cnf" \
+        --defaults-file="${MARIADB_PREFIX}/conf/my.cnf" \
         --user=mysql \
         --basedir="${MARIADB_PREFIX}" \
         --datadir="${DATADIR}"
@@ -43,4 +43,4 @@ fi
 
 # ── Start MariaDB ───────────────────────────────────────────────────────────
 exec "${MARIADB_PREFIX}/bin/mariadbd-safe" \
-    --defaults-file="${MARIADB_PREFIX}/my.cnf" "$@"
+    --defaults-file="${MARIADB_PREFIX}/conf/my.cnf" "$@"
