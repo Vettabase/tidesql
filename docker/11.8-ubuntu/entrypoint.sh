@@ -2,7 +2,7 @@
 # entrypoint.sh - Initialise the MariaDB data directory on first run and start the server.
 #
 # If MARIADB_PREFIX/data/mysql does not exist the data directory is initialised
-# with mariadb-install-db (mirrors what install.sh setup_mariadb() does).
+# with mariadb-install-db.
 # The server is then started via mariadbd-safe.
 set -eo pipefail
 
@@ -13,7 +13,7 @@ DATADIR="${MARIADB_PREFIX}/data"
 if [ ! -d "${DATADIR}/mysql" ]; then
     echo "[entrypoint] Initialising MariaDB data directory..."
 
-    # Locate mariadb-install-db (mirrors install.sh logic)
+    # Locate mariadb-install-db
     INSTALL_DB=""
     for candidate in \
         "${MARIADB_PREFIX}/scripts/mariadb-install-db" \
