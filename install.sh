@@ -691,9 +691,6 @@ tidesdb_compaction_threads = 4
 tidesdb_block_cache_size = 268435456
 tidesdb_max_open_sstables = 256
 tidesdb_log_level = WARN
-tidesdb_default_l0_queue_stall_threshold = 8
-tidesdb_default_klog_value_threshold = 4096
-tidesdb_max_open_sstables = 256
 
 [client]
 port = 3306
