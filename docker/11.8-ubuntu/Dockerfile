@@ -79,12 +79,12 @@ RUN export TIDESDB_ROOT="${TIDESDB_PREFIX}" && \
     fi && \
     rm -rf /tmp/tidesql-build
 
-# ── 6. Create mysql system user and prepare configuration directory ──────────
-# bind-address is set to 0.0.0.0 so the port is reachable from the Docker host.
+# ── 6. Create mysql system user and prepare data directory ──────────────────
 RUN useradd -r -s /bin/false -d "${MARIADB_PREFIX}/data" mysql && \
-    mkdir -p "${MARIADB_PREFIX}/data" "${MARIADB_PREFIX}/conf"
+    mkdir -p "${MARIADB_PREFIX}/data"
 
-COPY docker/11.8-ubuntu/my.cnf ${MARIADB_PREFIX}/conf/my.cnf
+# bind-address is set to 0.0.0.0 so the port is reachable from the Docker host.
+COPY docker/11.8-ubuntu/conf/ ${MARIADB_PREFIX}/conf/
 
 # ── 7. Install entrypoint ──────────────────────────────────────────────────
 COPY docker/11.8-ubuntu/entrypoint.sh /usr/local/bin/tidesql-entrypoint.sh
