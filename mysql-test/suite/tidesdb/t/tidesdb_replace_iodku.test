@@ -174,4 +174,5 @@ DROP TABLE t_rep_auto;
 
 
 --echo #
+--source suite/tidesdb/include/cleanup_tidesdb.inc
 --echo # Done.

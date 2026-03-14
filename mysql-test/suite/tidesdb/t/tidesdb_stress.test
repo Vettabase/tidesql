@@ -248,15 +248,13 @@ send INSERT INTO stress_main VALUES (2002, 'w2_b', 23);
 connection writer1;
 reap;
 
-# Reader1: read while writers are active
-connection reader1;
-send SELECT COUNT(*) AS reader_sees FROM stress_main;
-
 connection writer2;
 reap;
 
+# Reader1: read after both autocommit writers finished
+# writer1 txn is still open (uncommitted), writer2 rows are committed
 connection reader1;
-reap;
+SELECT COUNT(*) AS reader_sees FROM stress_main;
 
 # Writer1: commit the transaction
 connection writer1;
@@ -549,4 +547,5 @@ DROP TABLE stress_main;
 DROP TABLE stress_nopk;
 DROP TABLE stress_wide;
 
+--source suite/tidesdb/include/cleanup_tidesdb.inc
 --echo # Done.

@@ -116,3 +116,4 @@ SELECT * FROM t_dup ORDER BY i;
 SELECT COUNT(*) FROM t_dup;
 
 DROP TABLE t_dup;
+--source suite/tidesdb/include/cleanup_tidesdb.inc
