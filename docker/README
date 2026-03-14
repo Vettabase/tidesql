@@ -45,7 +45,7 @@ BUILD ARGUMENTS
 Override any of the following defaults with --build-arg KEY=VALUE:
 
   MARIADB_VERSION   MariaDB branch or tag to build   (default: 11.8)
-  TIDESDB_VERSION   TidesDB release tag to build      (default: 8.8.0)
+  TIDESDB_VERSION   TidesDB release tag to build      (default: v8.8.0)
   TIDESDB_PREFIX    TidesDB install prefix            (default: /usr/local)
   MARIADB_PREFIX    MariaDB install prefix            (default: /usr/local/mariadb)
   WITH_TESTS        Include test suite in image (1=yes, 0=no, default: 0)
