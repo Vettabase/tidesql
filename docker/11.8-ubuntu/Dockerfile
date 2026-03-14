@@ -79,63 +79,12 @@ RUN export TIDESDB_ROOT="${TIDESDB_PREFIX}" && \
     fi && \
     rm -rf /tmp/tidesql-build
 
-# ── 6. Create mysql system user and write MariaDB configuration ─────────────
+# ── 6. Create mysql system user and prepare configuration directory ──────────
 # bind-address is set to 0.0.0.0 so the port is reachable from the Docker host.
 RUN useradd -r -s /bin/false -d "${MARIADB_PREFIX}/data" mysql && \
-    mkdir -p "${MARIADB_PREFIX}/data" "${MARIADB_PREFIX}/conf" && \
-    { \
-      echo "[mysqld]"; \
-      echo "basedir  = ${MARIADB_PREFIX}"; \
-      echo "datadir  = ${MARIADB_PREFIX}/data"; \
-      echo "port     = 3306"; \
-      echo "socket   = /tmp/mariadb.sock"; \
-      echo "user     = mysql"; \
-      echo "pid-file = ${MARIADB_PREFIX}/data/mariadb.pid"; \
-      echo "log-error = ${MARIADB_PREFIX}/data/mariadb.err"; \
-      echo ""; \
-      echo "# Networking"; \
-      echo "bind-address    = 0.0.0.0"; \
-      echo "max_connections = 151"; \
-      echo ""; \
-      echo "# InnoDB"; \
-      echo "default_storage_engine        = InnoDB"; \
-      echo "innodb_buffer_pool_size       = 128M"; \
-      echo "innodb_log_file_size          = 48M"; \
-      echo "innodb_flush_log_at_trx_commit = 1"; \
-      echo "innodb_file_per_table         = ON"; \
-      echo ""; \
-      echo "# Logging"; \
-      echo "slow_query_log      = ON"; \
-      echo "slow_query_log_file = ${MARIADB_PREFIX}/data/slow.log"; \
-      echo "long_query_time     = 2"; \
-      echo ""; \
-      echo "# Character set"; \
-      echo "character-set-server = utf8mb4"; \
-      echo "collation-server     = utf8mb4_general_ci"; \
-      echo ""; \
-      echo "# TidesDB plugin — loaded at startup"; \
-      echo "plugin_maturity  = experimental"; \
-      echo "plugin_load_add  = ha_tidesdb.so"; \
-      echo ""; \
-      echo "# TidesDB settings (defaults shown — tune as needed)"; \
-      echo "tidesdb_flush_threads      = 2"; \
-      echo "tidesdb_compaction_threads = 2"; \
-      echo "tidesdb_block_cache_size   = 268435456"; \
-      echo "tidesdb_max_open_sstables  = 256"; \
-      echo "tidesdb_log_level          = WARN"; \
-      echo ""; \
-      echo "[client]"; \
-      echo "port                  = 3306"; \
-      echo "socket                = /tmp/mariadb.sock"; \
-      echo "default-character-set = utf8mb4"; \
-      echo ""; \
-      echo "[mysqldump]"; \
-      echo "quick"; \
-      echo "max_allowed_packet = 64M"; \
-      echo ""; \
-      echo "[mariadb-backup]"; \
-      echo "# mariabackup settings (defaults are fine)"; \
-    } > "${MARIADB_PREFIX}/conf/my.cnf"
+    mkdir -p "${MARIADB_PREFIX}/data" "${MARIADB_PREFIX}/conf"
+
+COPY docker/11.8-ubuntu/my.cnf ${MARIADB_PREFIX}/conf/my.cnf
 
 # ── 7. Install entrypoint ──────────────────────────────────────────────────
 COPY docker/11.8-ubuntu/entrypoint.sh /usr/local/bin/tidesql-entrypoint.sh
