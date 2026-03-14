@@ -74,6 +74,9 @@ RUN export TIDESDB_ROOT="${TIDESDB_PREFIX}" && \
         --config RelWithDebInfo --parallel "$(nproc)" && \
     cmake --install /tmp/tidesql-build/mariadb-server/build \
         --config RelWithDebInfo && \
+    if [ "${WITH_TESTS:-0}" != "1" ]; then \
+        rm -rf "${MARIADB_PREFIX}/mysql-test" "${MARIADB_PREFIX}/mariadb-test"; \
+    fi && \
     rm -rf /tmp/tidesql-build
 
 # ── 6. Create mysql system user and write MariaDB configuration ─────────────
