@@ -58,7 +58,9 @@ RUN git clone --depth 1 --branch "${MARIADB_VERSION}" \
     fi
 
 # ── 5. Configure, build, and install MariaDB ───────────────────────────────
+ARG WITH_TESTS
 RUN export TIDESDB_ROOT="${TIDESDB_PREFIX}" && \
+    TEST_DIR_FLAG=$([ "${WITH_TESTS:-0}" = "1" ] || echo "-DINSTALL_MYSQLTESTDIR=OFF") && \
     cmake \
         -S /tmp/tidesql-build/mariadb-server \
         -B /tmp/tidesql-build/mariadb-server/build \
@@ -66,14 +68,12 @@ RUN export TIDESDB_ROOT="${TIDESDB_PREFIX}" && \
         -DCMAKE_BUILD_TYPE=RelWithDebInfo \
         -DWITH_MARIABACKUP=ON \
         -DWITH_UNIT_TESTS=OFF \
-        -DCMAKE_PREFIX_PATH="${TIDESDB_PREFIX}" && \
+        -DCMAKE_PREFIX_PATH="${TIDESDB_PREFIX}" \
+        ${TEST_DIR_FLAG} && \
     cmake --build /tmp/tidesql-build/mariadb-server/build \
         --config RelWithDebInfo --parallel "$(nproc)" && \
     cmake --install /tmp/tidesql-build/mariadb-server/build \
         --config RelWithDebInfo && \
-    if [ "${WITH_TESTS}" = "0" ]; then \
-        rm -rf "${MARIADB_PREFIX}/mysql-test" /opt/tidesql/mysql-test; \
-    fi && \
     rm -rf /tmp/tidesql-build
 
 # ── 6. Create mysql system user and write MariaDB configuration ─────────────
