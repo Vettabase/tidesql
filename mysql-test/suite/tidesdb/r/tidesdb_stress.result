@@ -247,12 +247,11 @@ INSERT INTO stress_main VALUES (1002, 'w1_b', 12);
 connection writer2;
 INSERT INTO stress_main VALUES (2002, 'w2_b', 23);
 connection writer1;
-connection reader1;
-SELECT COUNT(*) AS reader_sees FROM stress_main;
 connection writer2;
 connection reader1;
+SELECT COUNT(*) AS reader_sees FROM stress_main;
 reader_sees
-8
+9
 connection writer1;
 COMMIT;
 connection writer2;

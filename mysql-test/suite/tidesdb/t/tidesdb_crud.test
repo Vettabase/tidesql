@@ -338,4 +338,5 @@ SELECT * FROM t_drop;
 --echo #
 
 
+--source suite/tidesdb/include/cleanup_tidesdb.inc
 --echo # Done.

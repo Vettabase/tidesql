@@ -44,4 +44,5 @@ SET autocommit=1;
 DROP TABLE t_alt70;
 
 --echo #
+--source suite/tidesdb/include/cleanup_tidesdb.inc
 --echo # Done.

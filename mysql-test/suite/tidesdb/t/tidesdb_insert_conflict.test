@@ -51,4 +51,5 @@ connection default;
 DROP TABLE t;
 
 --echo #
+--source suite/tidesdb/include/cleanup_tidesdb.inc
 --echo # Done.
