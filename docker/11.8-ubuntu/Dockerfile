@@ -8,6 +8,9 @@ ARG TIDESDB_PREFIX=/usr/local
 ARG MARIADB_PREFIX=/usr/local/mariadb
 # Set WITH_TESTS=1 to include the MariaDB + TidesDB test suite in the image.
 ARG WITH_TESTS=0
+# Comma-separated list of optional storage engines to disable at compile time.
+# Managed automatically by docker/rebuild.sh via EXCLUDE_ENGINES / INCLUDE_ENGINES.
+ARG DISABLED_ENGINES=""
 
 # Persist key paths as environment variables so they are available in every
 # RUN step and at container runtime.
@@ -59,8 +62,15 @@ RUN git clone --depth 1 --branch "${MARIADB_VERSION}" \
 
 # ── 5. Configure, build, and install MariaDB ───────────────────────────────
 ARG WITH_TESTS
+ARG DISABLED_ENGINES
 RUN export TIDESDB_ROOT="${TIDESDB_PREFIX}" && \
     TEST_DIR_FLAG=$([ "${WITH_TESTS:-0}" = "1" ] || echo "-DINSTALL_MYSQLTESTDIR=OFF") && \
+    ENGINE_FLAGS="" && \
+    if [ -n "${DISABLED_ENGINES}" ]; then \
+        for _eng in $(echo "${DISABLED_ENGINES}" | tr ',' ' '); do \
+            ENGINE_FLAGS="${ENGINE_FLAGS} -DPLUGIN_${_eng}=NO"; \
+        done; \
+    fi && \
     cmake \
         -S /tmp/tidesql-build/mariadb-server \
         -B /tmp/tidesql-build/mariadb-server/build \
@@ -69,7 +79,8 @@ RUN export TIDESDB_ROOT="${TIDESDB_PREFIX}" && \
         -DWITH_MARIABACKUP=ON \
         -DWITH_UNIT_TESTS=OFF \
         -DCMAKE_PREFIX_PATH="${TIDESDB_PREFIX}" \
-        ${TEST_DIR_FLAG} && \
+        ${TEST_DIR_FLAG} \
+        ${ENGINE_FLAGS} && \
     cmake --build /tmp/tidesql-build/mariadb-server/build \
         --config RelWithDebInfo --parallel "$(nproc)" && \
     cmake --install /tmp/tidesql-build/mariadb-server/build \

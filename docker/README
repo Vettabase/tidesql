@@ -53,6 +53,36 @@ Environment variables accepted by the script:
   TAG              Image tag to build and run   (default: tidesql:11.8-ubuntu)
   CONTAINER_NAME   Container name               (default: tidesql)
 
+  EXCLUDE_ENGINES  Comma-separated list of optional engines to exclude from the
+                   build.  Engine names are case-insensitive.  Use ALL to
+                   include all optional engines (same as leaving it unset).
+
+  INCLUDE_ENGINES  Comma-separated list of optional engines to include.  All
+                   other optional engines are excluded.  Engine names are
+                   case-insensitive.
+
+EXCLUDE_ENGINES and INCLUDE_ENGINES cannot be set at the same time.
+
+Optional engines that can be excluded or selectively included:
+
+  ARCHIVE, BLACKHOLE, CONNECT, EXAMPLE, FEDERATED, FEDERATEDX,
+  MROONGA, ROCKSDB, S3, SPHINX, SPIDER
+
+The following engines are always compiled in and cannot be excluded:
+TidesDB, InnoDB, Aria, MyISAM, SEQUENCE.
+
+Specifying an engine name outside the optional list in either variable, or
+specifying an always-included engine in EXCLUDE_ENGINES, will cause the
+script to exit with an error before the build starts.
+
+Example — build without Mroonga and RocksDB:
+
+  EXCLUDE_ENGINES=Mroonga,RocksDB bash docker/rebuild.sh
+
+Example — build with only Blackhole and RocksDB (all others excluded):
+
+  INCLUDE_ENGINES=BLACKHOLE,ROCKSDB bash docker/rebuild.sh
+
 Example — build and run with a custom tag:
 
   TAG=tidesql:dev bash docker/rebuild.sh
@@ -71,6 +101,10 @@ Override any of the following defaults with --build-arg KEY=VALUE:
   TIDESDB_PREFIX    TidesDB install prefix            (default: /usr/local)
   MARIADB_PREFIX    MariaDB install prefix            (default: /usr/local/mariadb)
   WITH_TESTS        Include test suite in image (1=yes, 0=no, default: 0)
+  DISABLED_ENGINES  Comma-separated list of optional storage engines to
+                    disable at compile time (e.g. MROONGA,ROCKSDB).
+                    Normally set indirectly via EXCLUDE_ENGINES /
+                    INCLUDE_ENGINES in rebuild.sh (see REBUILD SCRIPT above).
 
 When WITH_TESTS=0 (default) the MariaDB mysql-test/ directory and the TidesDB
 test suite are removed from the final image, reducing its size.  Set
