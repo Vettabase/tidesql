@@ -7,7 +7,7 @@
 set -eo pipefail
 
 MARIADB_PREFIX="${MARIADB_PREFIX:-/usr/local/mariadb}"
-DATADIR="${MARIADB_PREFIX}/data"
+DATADIR="${MARIADB_PREFIX}/data/misc"
 
 # ── Initialise data directory if it has not been set up yet ────────────────
 if [ ! -d "${DATADIR}/mysql" ]; then
@@ -42,8 +42,10 @@ if [ ! -d "${DATADIR}/mysql" ]; then
 fi
 
 # ── Start MariaDB ───────────────────────────────────────────────────────────
-# Ensure the mysql user owns the configuration directory (handles volume mounts).
+# Ensure runtime directories exist with correct ownership (handles volume mounts).
 chown -R mysql:mysql /etc/mysql
+mkdir -p "${DATADIR}" "${MARIADB_PREFIX}/log"
+chown -R mysql:mysql "${MARIADB_PREFIX}/data" "${MARIADB_PREFIX}/log"
 
 exec "${MARIADB_PREFIX}/bin/mariadbd-safe" \
     --defaults-file="/etc/mysql/my.cnf" "$@"

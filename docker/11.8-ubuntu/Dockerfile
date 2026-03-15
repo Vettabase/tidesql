@@ -79,9 +79,12 @@ RUN export TIDESDB_ROOT="${TIDESDB_PREFIX}" && \
     fi && \
     rm -rf /tmp/tidesql-build
 
-# ── 6. Create mysql system user and prepare data directory ──────────────────
+# ── 6. Create mysql system user and prepare runtime directories ─────────────
 RUN useradd -r -s /bin/false -d "${MARIADB_PREFIX}/data" mysql && \
-    mkdir -p "${MARIADB_PREFIX}/data"
+    mkdir -p "${MARIADB_PREFIX}/data/misc" \
+             "${MARIADB_PREFIX}/log" && \
+    chown -R mysql:mysql "${MARIADB_PREFIX}/data" \
+                         "${MARIADB_PREFIX}/log"
 
 # bind-address is set to 0.0.0.0 so the port is reachable from the Docker host.
 COPY docker/11.8-ubuntu/conf/ /etc/mysql/
