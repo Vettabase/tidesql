@@ -81,7 +81,7 @@ RUN export TIDESDB_ROOT="${TIDESDB_PREFIX}" && \
 
 # ── 6. Create mysql system user and prepare runtime directories ─────────────
 RUN useradd -r -s /bin/false -d "${MARIADB_PREFIX}/data" mysql && \
-    mkdir -p "${MARIADB_PREFIX}/data/misc" \
+    mkdir -p "${MARIADB_PREFIX}/data" \
              "${MARIADB_PREFIX}/log" && \
     chown -R mysql:mysql "${MARIADB_PREFIX}/data" \
                          "${MARIADB_PREFIX}/log"
