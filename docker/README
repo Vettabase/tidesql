@@ -39,6 +39,28 @@ The build compiles MariaDB and TidesDB from source, so it typically takes
 20–40 minutes depending on available CPU cores.
 
 
+REBUILD SCRIPT
+░░░░░░░░░░░░░░░░░░░░░░░░
+
+docker/rebuild.sh automates a full clean rebuild: it removes any existing
+container, volumes, and image, builds a fresh image, starts a new container,
+and tails the logs.  It can be run from any directory:
+
+  bash /path/to/docker/rebuild.sh
+
+Environment variables accepted by the script:
+
+  TAG              Image tag to build and run   (default: tidesql:11.8-ubuntu)
+  CONTAINER_NAME   Container name               (default: tidesql)
+
+Example — build and run with a custom tag:
+
+  TAG=tidesql:dev bash docker/rebuild.sh
+
+Note: rebuild.sh always passes --no-cache to docker build, so every run
+performs a full from-scratch build.
+
+
 BUILD ARGUMENTS
 ░░░░░░░░░░░░░░░░░░░░░░░░
 
