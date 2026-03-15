@@ -63,7 +63,7 @@ RUN git clone --depth 1 --branch "${MARIADB_VERSION}" \
 # ── 5. Configure, build, and install MariaDB ───────────────────────────────
 ARG WITH_TESTS
 ARG DISABLED_ENGINES
-COPY docker/11.8-ubuntu/cmake_exclude_engines.sh /usr/local/bin/cmake_exclude_engines.sh
+COPY docker/11.8-ubuntu/utils/cmake_exclude_engines.sh /usr/local/bin/cmake_exclude_engines.sh
 RUN chmod +x /usr/local/bin/cmake_exclude_engines.sh
 RUN export TIDESDB_ROOT="${TIDESDB_PREFIX}" && \
     TEST_DIR_FLAG=$([ "${WITH_TESTS:-0}" = "1" ] || echo "-DINSTALL_MYSQLTESTDIR=OFF") && \
