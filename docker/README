@@ -72,7 +72,7 @@ restarts:
   docker run -d \
       --name tidesql \
       -p 3306:3306 \
-      -v tidesql-conf:/usr/local/mariadb/conf \
+      -v tidesql-conf:/etc/mysql \
       -v tidesql-data:/usr/local/mariadb/data \
       tidesql:11.8-ubuntu
 
@@ -86,7 +86,7 @@ host directory there to supply your own configuration:
   docker run -d \
       --name tidesql \
       -p 3306:3306 \
-      -v /path/to/your/conf:/usr/local/mariadb/conf \
+      -v /path/to/your/conf:/etc/mysql \
       -v tidesql-data:/usr/local/mariadb/data \
       tidesql:11.8-ubuntu
 
@@ -146,7 +146,7 @@ Run:
   podman run -d \
       --name tidesql \
       -p 3306:3306 \
-      -v tidesql-conf:/usr/local/mariadb/conf \
+      -v tidesql-conf:/etc/mysql \
       -v tidesql-data:/usr/local/mariadb/data \
       tidesql:11.8-ubuntu
 
