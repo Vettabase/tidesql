@@ -8,8 +8,6 @@ ARG TIDESDB_PREFIX=/usr/local
 ARG MARIADB_PREFIX=/usr/local/mariadb
 # Set WITH_TESTS=1 to include the MariaDB + TidesDB test suite in the image.
 ARG WITH_TESTS=0
-# Set WITH_GALERA=1 to enable Galera/WSREP support in the build.
-ARG WITH_GALERA=0
 
 # Persist key paths as environment variables so they are available in every
 # RUN step and at container runtime.
@@ -61,10 +59,8 @@ RUN git clone --depth 1 --branch "${MARIADB_VERSION}" \
 
 # ── 5. Configure, build, and install MariaDB ───────────────────────────────
 ARG WITH_TESTS
-ARG WITH_GALERA
 RUN export TIDESDB_ROOT="${TIDESDB_PREFIX}" && \
     TEST_DIR_FLAG=$([ "${WITH_TESTS:-0}" = "1" ] || echo "-DINSTALL_MYSQLTESTDIR=OFF") && \
-    GALERA_FLAGS=$([ "${WITH_GALERA:-0}" = "1" ] || echo "-DWITH_WSREP=OFF -DWITH_INNODB_DISALLOW_WRITES=OFF") && \
     cmake \
         -S /tmp/tidesql-build/mariadb-server \
         -B /tmp/tidesql-build/mariadb-server/build \
@@ -73,8 +69,7 @@ RUN export TIDESDB_ROOT="${TIDESDB_PREFIX}" && \
         -DWITH_MARIABACKUP=ON \
         -DWITH_UNIT_TESTS=OFF \
         -DCMAKE_PREFIX_PATH="${TIDESDB_PREFIX}" \
-        ${TEST_DIR_FLAG} \
-        ${GALERA_FLAGS} && \
+        ${TEST_DIR_FLAG} && \
     cmake --build /tmp/tidesql-build/mariadb-server/build \
         --config RelWithDebInfo --parallel "$(nproc)" && \
     cmake --install /tmp/tidesql-build/mariadb-server/build \

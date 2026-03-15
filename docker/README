@@ -71,16 +71,10 @@ Override any of the following defaults with --build-arg KEY=VALUE:
   TIDESDB_PREFIX    TidesDB install prefix            (default: /usr/local)
   MARIADB_PREFIX    MariaDB install prefix            (default: /usr/local/mariadb)
   WITH_TESTS        Include test suite in image (1=yes, 0=no, default: 0)
-  WITH_GALERA       Enable Galera/WSREP support  (1=yes, 0=no, default: 0)
 
 When WITH_TESTS=0 (default) the MariaDB mysql-test/ directory and the TidesDB
 test suite are removed from the final image, reducing its size.  Set
 WITH_TESTS=1 to keep them for development or CI use.
-
-When WITH_GALERA=0 (default) MariaDB is compiled with
--DWITH_WSREP=OFF -DWITH_INNODB_DISALLOW_WRITES=OFF, which reduces build time
-and image size when Galera replication is not needed.  Set WITH_GALERA=1 to
-enable Galera/WSREP support.
 
 Example — include the test suite:
 
