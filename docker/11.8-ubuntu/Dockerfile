@@ -84,13 +84,14 @@ RUN useradd -r -s /bin/false -d "${MARIADB_PREFIX}/data" mysql && \
     mkdir -p "${MARIADB_PREFIX}/data"
 
 # bind-address is set to 0.0.0.0 so the port is reachable from the Docker host.
-COPY docker/11.8-ubuntu/conf/ ${MARIADB_PREFIX}/conf/
+COPY docker/11.8-ubuntu/conf/ /etc/mysql/
+RUN chown -R mysql:mysql /etc/mysql
 
 # ── 7. Install entrypoint ──────────────────────────────────────────────────
 COPY docker/11.8-ubuntu/entrypoint.sh /usr/local/bin/tidesql-entrypoint.sh
 RUN chmod +x /usr/local/bin/tidesql-entrypoint.sh
 
-VOLUME /usr/local/mariadb/conf
+VOLUME /etc/mysql
 VOLUME /usr/local/mariadb/data
 
 EXPOSE 3306

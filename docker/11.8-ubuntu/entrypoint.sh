@@ -32,7 +32,7 @@ if [ ! -d "${DATADIR}/mysql" ]; then
     fi
 
     "${INSTALL_DB}" \
-        --defaults-file="${MARIADB_PREFIX}/conf/my.cnf" \
+        --defaults-file="/etc/mysql/my.cnf" \
         --user=mysql \
         --basedir="${MARIADB_PREFIX}" \
         --datadir="${DATADIR}"
@@ -42,5 +42,8 @@ if [ ! -d "${DATADIR}/mysql" ]; then
 fi
 
 # ── Start MariaDB ───────────────────────────────────────────────────────────
+# Ensure the mysql user owns the configuration directory (handles volume mounts).
+chown -R mysql:mysql /etc/mysql
+
 exec "${MARIADB_PREFIX}/bin/mariadbd-safe" \
-    --defaults-file="${MARIADB_PREFIX}/conf/my.cnf" "$@"
+    --defaults-file="/etc/mysql/my.cnf" "$@"
