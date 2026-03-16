@@ -47,5 +47,5 @@ chown -R mysql:mysql /etc/mysql
 mkdir -p "${DATADIR}" "${MARIADB_PREFIX}/log"
 chown -R mysql:mysql "${MARIADB_PREFIX}/data" "${MARIADB_PREFIX}/log"
 
-exec "${MARIADB_PREFIX}/bin/mariadbd-safe" \
+exec "${MARIADB_PREFIX}/bin/mariadbd" \
     --defaults-file="/etc/mysql/my.cnf" "$@"
