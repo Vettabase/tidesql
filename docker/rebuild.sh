@@ -92,7 +92,7 @@ echo "### 2. Building the new image..."
 BUILD_ARGS=()
 [ -n "$DISABLED_ENGINES" ] && BUILD_ARGS+=(--build-arg "DISABLED_ENGINES=${DISABLED_ENGINES}")
 docker build \
-    -f "${REPO_ROOT}/docker/11.8-ubuntu/Dockerfile" \
+    -f "${REPO_ROOT}/docker/ubuntu/Dockerfile" \
     -t "$TAG" \
     --no-cache \
     "${BUILD_ARGS[@]}" \
