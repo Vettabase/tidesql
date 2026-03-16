@@ -11,6 +11,7 @@ TAG=${TAG:-"11.8-ubuntu"}
 CONTAINER_NAME=${CONTAINER_NAME:-"tidesql"}
 VOLUME_DATA="tidesql-data"
 VOLUME_CONF="tidesql-conf"
+VOLUME_LOG="tidesql-log"
 
 # ── Storage engine selection ──────────────────────────────────────────────────
 # Optional engines that can be excluded or selectively included.
@@ -100,6 +101,7 @@ docker run -d \
     -p 3306:3306 \
     -v "$VOLUME_CONF":/etc/mysql \
     -v "$VOLUME_DATA":/usr/local/mariadb/data \
+    -v "$VOLUME_LOG":/usr/local/mariadb/log \
     "${IMAGE_NAME}:${TAG}"
 r=$?
 

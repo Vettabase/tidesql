@@ -104,6 +104,7 @@ RUN chmod +x /usr/local/bin/tidesql-entrypoint.sh
 
 VOLUME /etc/mysql
 VOLUME /usr/local/mariadb/data
+VOLUME /usr/local/mariadb/log
 
 EXPOSE 3306
 
