@@ -18,7 +18,9 @@ docker/
 │   ├── Dockerfile
 │   └── entrypoint.sh
 ├── README.md
-└── rebuild.sh
+├── cleanup.sh
+├── rebuild.sh
+└── setup.sh
 
 
 AVAILABLE IMAGES
@@ -62,9 +64,14 @@ and tails the logs.  It can be run from any directory:
 
   bash /path/to/docker/rebuild.sh
 
-Environment variables accepted by the script:
+docker/cleanup.sh removes the container, volumes, and image without rebuilding.
+docker/setup.sh builds the image and starts the container without cleanup first.
+Both can be run independently from any directory.
 
-  TAG              Image tag to build and run   (default: tidesql:11.8-ubuntu)
+Environment variables accepted by the scripts:
+
+  IMAGE_NAME       Image name                   (default: tidesql)
+  TAG              Image tag                    (default: 11.8-ubuntu)
   CONTAINER_NAME   Container name               (default: tidesql)
 
   EXCLUDE_ENGINES  Comma-separated list of optional engines to exclude from the
@@ -97,9 +104,9 @@ Example — build with only Blackhole and RocksDB (all others excluded):
 
   INCLUDE_ENGINES=BLACKHOLE,ROCKSDB bash docker/rebuild.sh
 
-Example — build and run with a custom tag:
+Example — build and run with a custom image name and tag:
 
-  TAG=tidesql:dev bash docker/rebuild.sh
+  IMAGE_NAME=myrepo/tidesql TAG=dev bash docker/rebuild.sh
 
 Note: rebuild.sh always passes --no-cache to docker build, so every run
 performs a full from-scratch build.
