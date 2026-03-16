@@ -6,7 +6,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 # Configuration
-TAG=${TAG:-"tidesql:11.8-ubuntu"}
+IMAGE_NAME=${IMAGE_NAME:-"tidesql"}
+TAG=${TAG:-"11.8-ubuntu"}
 CONTAINER_NAME=${CONTAINER_NAME:-"tidesql"}
 VOLUME_DATA="tidesql-data"
 VOLUME_CONF="tidesql-conf"
@@ -88,7 +89,7 @@ BUILD_ARGS=()
 [ -n "$DISABLED_ENGINES" ] && BUILD_ARGS+=(--build-arg "DISABLED_ENGINES=${DISABLED_ENGINES}")
 docker build \
     -f "${REPO_ROOT}/docker/ubuntu/Dockerfile" \
-    -t "$TAG" \
+    -t "${IMAGE_NAME}:${TAG}" \
     --no-cache \
     "${BUILD_ARGS[@]}" \
     "${REPO_ROOT}"
@@ -99,7 +100,7 @@ docker run -d \
     -p 3306:3306 \
     -v "$VOLUME_CONF":/etc/mysql \
     -v "$VOLUME_DATA":/usr/local/mariadb/data \
-    "$TAG"
+    "${IMAGE_NAME}:${TAG}"
 r=$?
 
 echo
