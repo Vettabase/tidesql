@@ -151,6 +151,7 @@ restarts:
       -p 3306:3306 \
       -v tidesql-conf:/etc/mysql \
       -v tidesql-data:/usr/local/mariadb/data \
+      -v tidesql-log:/usr/local/mariadb/log \
       tidesql:11.8-ubuntu
 
 On the first start the entrypoint initialises the data directory
@@ -165,6 +166,7 @@ host directory there to supply your own configuration:
       -p 3306:3306 \
       -v /path/to/your/conf:/etc/mysql \
       -v tidesql-data:/usr/local/mariadb/data \
+      -v tidesql-log:/usr/local/mariadb/log \
       tidesql:11.8-ubuntu
 
 Connect from the host:
@@ -225,6 +227,7 @@ Run:
       -p 3306:3306 \
       -v tidesql-conf:/etc/mysql \
       -v tidesql-data:/usr/local/mariadb/data \
+      -v tidesql-log:/usr/local/mariadb/log \
       tidesql:11.8-ubuntu
 
 Connect from the host:
@@ -240,7 +243,7 @@ Stop and remove:
 
   podman stop tidesql
   podman rm   tidesql
-  podman volume rm tidesql-conf tidesql-data
+  podman volume rm tidesql-conf tidesql-data tidesql-log
 
 
 STOPPING AND REMOVING
@@ -248,4 +251,4 @@ STOPPING AND REMOVING
 
   docker stop tidesql
   docker rm   tidesql
-  docker volume rm tidesql-conf tidesql-data   # removes persistent data — irreversible
+  docker volume rm tidesql-conf tidesql-data tidesql-log   # removes persistent data — irreversible
