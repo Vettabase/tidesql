@@ -63,7 +63,7 @@ RUN git clone --depth 1 --branch "${MARIADB_VERSION}" \
 # ── 5. Configure, build, and install MariaDB ───────────────────────────────
 ARG WITH_TESTS=0
 ARG DISABLED_ENGINES=""
-COPY docker/11.8-ubuntu/utils/cmake_exclude_engines.sh /usr/local/bin/cmake_exclude_engines.sh
+COPY docker/ubuntu/utils/cmake_exclude_engines.sh /usr/local/bin/cmake_exclude_engines.sh
 RUN chmod +x /usr/local/bin/cmake_exclude_engines.sh
 RUN export TIDESDB_ROOT="${TIDESDB_PREFIX}" && \
     TEST_DIR_FLAG=$([ "${WITH_TESTS:-0}" = "1" ] || echo "-DINSTALL_MYSQLTESTDIR=OFF") && \
@@ -95,11 +95,11 @@ RUN useradd -r -s /bin/false -d "${MARIADB_PREFIX}/data" mysql && \
                          "${MARIADB_PREFIX}/log"
 
 # bind-address is set to 0.0.0.0 so the port is reachable from the Docker host.
-COPY docker/11.8-ubuntu/conf/ /etc/mysql/
+COPY docker/conf/ /etc/mysql/
 RUN chown -R mysql:mysql /etc/mysql
 
 # ── 7. Install entrypoint ──────────────────────────────────────────────────
-COPY docker/11.8-ubuntu/entrypoint.sh /usr/local/bin/tidesql-entrypoint.sh
+COPY docker/ubuntu/entrypoint.sh /usr/local/bin/tidesql-entrypoint.sh
 RUN chmod +x /usr/local/bin/tidesql-entrypoint.sh
 
 VOLUME /etc/mysql

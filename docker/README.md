@@ -2,15 +2,29 @@ TIDESQL DOCKER IMAGES
 ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
 
 This directory contains Dockerfiles for running TidesSQL (MariaDB + TidesDB
-storage engine) in a container.  Each subdirectory is named
-<mariadb-version>-<base-os> and contains a self-contained Dockerfile together
-with a startup entrypoint.
+storage engine) in a container.  Each subdirectory is named after the base OS
+and contains a self-contained Dockerfile together with a startup entrypoint.
+
+
+TREE
+░░░░░░░░░░░░░░░░░░░░░░░░
+
+docker/
+├── conf/
+│   └── my.cnf
+├── ubuntu/
+│   ├── utils/
+│   │   └── cmake_exclude_engines.sh
+│   ├── Dockerfile
+│   └── entrypoint.sh
+├── README.md
+└── rebuild.sh
 
 
 AVAILABLE IMAGES
 ░░░░░░░░░░░░░░░░░░░░░░░░
 
-  11.8-ubuntu     MariaDB 11.8 on Ubuntu 24.04 (ubuntu:24.04)
+  ubuntu     MariaDB 11.8 on Ubuntu 24.04 (ubuntu:24.04)
 
 
 PREREQUISITES
@@ -29,9 +43,9 @@ All docker build commands must be run from the repository root so that the
 Dockerfile can COPY the tidesdb/ plugin source and the mysql-test/ test suite
 into the image.
 
-  # Build the 11.8-ubuntu image with default settings
+  # Build the ubuntu image with default settings
   docker build \
-      -f docker/11.8-ubuntu/Dockerfile \
+      -f docker/ubuntu/Dockerfile \
       -t tidesql:11.8-ubuntu \
       .
 
@@ -113,7 +127,7 @@ WITH_TESTS=1 to keep them for development or CI use.
 Example — include the test suite:
 
   docker build \
-      -f docker/11.8-ubuntu/Dockerfile \
+      -f docker/ubuntu/Dockerfile \
       --build-arg WITH_TESTS=1 \
       -t tidesql:11.8-ubuntu-tests \
       .
@@ -193,7 +207,7 @@ operations used here.
 Build:
 
   podman build \
-      -f docker/11.8-ubuntu/Dockerfile \
+      -f docker/ubuntu/Dockerfile \
       -t tidesql:11.8-ubuntu \
       .
 
