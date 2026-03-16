@@ -15,7 +15,7 @@ VOLUME_CONF="tidesql-conf"
 # Optional engines that can be excluded or selectively included.
 KNOWN_OPTIONAL_ENGINES="ARCHIVE BLACKHOLE CONNECT EXAMPLE FEDERATED FEDERATEDX MROONGA ROCKSDB S3 SPHINX SPIDER"
 # Engines that are always present in the build (cannot be excluded).
-ALWAYS_INCLUDED_ENGINES="TIDESDB INNODB ARIA MYISAM SEQUENCE"
+ALWAYS_INCLUDED_ENGINES="TIDESDB INNODB ARIA MYISAM CSV MEMORY HEAP MERGE MRG_MyISAM SEQUENCE"
 
 _upper_space() {
     echo "$1" | tr '[:lower:]' '[:upper:]' | tr ',' ' '
