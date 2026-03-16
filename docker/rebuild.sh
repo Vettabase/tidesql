@@ -89,13 +89,13 @@ docker volume rm "$VOLUME_DATA" "$VOLUME_CONF" 2>/dev/null || true
 docker rmi -f "$TAG" 2>/dev/null || true
 
 echo "### 2. Building the new image..."
-BUILD_ARGS=""
-[ -n "$DISABLED_ENGINES" ] && BUILD_ARGS="--build-arg DISABLED_ENGINES=${DISABLED_ENGINES}"
+BUILD_ARGS=()
+[ -n "$DISABLED_ENGINES" ] && BUILD_ARGS+=(--build-arg "DISABLED_ENGINES=${DISABLED_ENGINES}")
 docker build \
     -f "${REPO_ROOT}/docker/11.8-ubuntu/Dockerfile" \
     -t "$TAG" \
     --no-cache \
-    ${BUILD_ARGS} \
+    "${BUILD_ARGS[@]}" \
     "${REPO_ROOT}"
 
 echo "### 3. Starting the container..."
