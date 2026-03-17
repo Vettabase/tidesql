@@ -9,6 +9,7 @@ and contains a self-contained Dockerfile together with a startup entrypoint.
 TREE
 ░░░░░░░░░░░░░░░░░░░░░░░░
 
+```
 docker/
 ├── conf/
 │   └── my.cnf
@@ -21,6 +22,7 @@ docker/
 ├── cleanup.sh
 ├── rebuild.sh
 └── setup.sh
+```
 
 
 AVAILABLE IMAGES
