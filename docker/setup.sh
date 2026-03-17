@@ -85,8 +85,24 @@ elif [ -n "${INCLUDE_ENGINES:-}" ]; then
     DISABLED_ENGINES="$_disabled"
 fi
 
+# ── Resolve MARIADB_VERSION and TIDESDB_VERSION ───────────────────────────────
+MARIADB_VERSION=${MARIADB_VERSION:-"11.8"}
+
+if [ -z "${TIDESDB_VERSION:-}" ]; then
+    _tidesdb_latest=$(curl -fsSL "https://api.github.com/repos/tidesdb/tidesdb/releases/latest" 2>/dev/null \
+        | grep '"tag_name":' | sed -E 's/.*"tag_name": *"([^"]+)".*/\1/')
+    if [ -z "$_tidesdb_latest" ]; then
+        echo "Warning: Could not fetch latest TidesDB version from GitHub; falling back to v8.8.0." >&2
+        _tidesdb_latest="v8.8.0"
+    fi
+    TIDESDB_VERSION="$_tidesdb_latest"
+fi
+
 echo "### 2. Building the new image..."
-BUILD_ARGS=()
+BUILD_ARGS=(
+    --build-arg "MARIADB_VERSION=${MARIADB_VERSION}"
+    --build-arg "TIDESDB_VERSION=${TIDESDB_VERSION}"
+)
 [ -n "$DISABLED_ENGINES" ] && BUILD_ARGS+=(--build-arg "DISABLED_ENGINES=${DISABLED_ENGINES}")
 docker build \
     -f "${REPO_ROOT}/docker/ubuntu/Dockerfile" \

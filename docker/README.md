@@ -48,6 +48,8 @@ into the image.
   # Build the ubuntu image with default settings
   docker build \
       -f docker/ubuntu/Dockerfile \
+      --build-arg MARIADB_VERSION=11.8 \
+      --build-arg TIDESDB_VERSION=v8.8.0 \
       -t tidesql:11.8-ubuntu \
       .
 
@@ -70,9 +72,11 @@ Both can be run independently from any directory.
 
 Environment variables accepted by the scripts:
 
-  IMAGE_NAME       Image name                   (default: tidesql)
-  TAG              Image tag                    (default: 11.8-ubuntu)
-  CONTAINER_NAME   Container name               (default: tidesql)
+  IMAGE_NAME        Image name                   (default: tidesql)
+  TAG               Image tag                    (default: 11.8-ubuntu)
+  CONTAINER_NAME    Container name               (default: tidesql)
+  MARIADB_VERSION   MariaDB branch/tag to build  (default: 11.8)
+  TIDESDB_VERSION   TidesDB release tag to build (default: latest from GitHub)
 
   EXCLUDE_ENGINES  Comma-separated list of optional engines to exclude from the
                    build.  Engine names are case-insensitive.  Use ALL to
@@ -115,10 +119,10 @@ performs a full from-scratch build.
 BUILD ARGUMENTS
 ░░░░░░░░░░░░░░░░░░░░░░░░
 
-Override any of the following defaults with --build-arg KEY=VALUE:
+Override any of the following with --build-arg KEY=VALUE:
 
-  MARIADB_VERSION   MariaDB branch or tag to build   (default: 11.8)
-  TIDESDB_VERSION   TidesDB release tag to build      (default: v8.8.0)
+  MARIADB_VERSION   MariaDB branch or tag to build   (required; no default in Dockerfile)
+  TIDESDB_VERSION   TidesDB release tag to build     (required; no default in Dockerfile)
   TIDESDB_PREFIX    TidesDB install prefix            (default: /usr/local)
   MARIADB_PREFIX    MariaDB install prefix            (default: /usr/local/mariadb)
   WITH_TESTS        Include test suite in image (1=yes, 0=no, default: 0)
@@ -126,6 +130,11 @@ Override any of the following defaults with --build-arg KEY=VALUE:
                     disable at compile time (e.g. MROONGA,ROCKSDB).
                     Normally set indirectly via EXCLUDE_ENGINES /
                     INCLUDE_ENGINES in rebuild.sh (see REBUILD SCRIPT above).
+
+MARIADB_VERSION and TIDESDB_VERSION have no default in the Dockerfile and must
+always be supplied.  The scripts (rebuild.sh, setup.sh) default them to 11.8
+and the latest TidesDB release from GitHub respectively, so a bare
+"bash docker/rebuild.sh" works without any extra configuration.
 
 When WITH_TESTS=0 (default) the MariaDB mysql-test/ directory and the TidesDB
 test suite are removed from the final image, reducing its size.  Set
@@ -135,6 +144,8 @@ Example — include the test suite:
 
   docker build \
       -f docker/ubuntu/Dockerfile \
+      --build-arg MARIADB_VERSION=11.8 \
+      --build-arg TIDESDB_VERSION=v8.8.0 \
       --build-arg WITH_TESTS=1 \
       -t tidesql:11.8-ubuntu-tests \
       .
@@ -217,6 +228,8 @@ Build:
 
   podman build \
       -f docker/ubuntu/Dockerfile \
+      --build-arg MARIADB_VERSION=11.8 \
+      --build-arg TIDESDB_VERSION=v8.8.0 \
       -t tidesql:11.8-ubuntu \
       .
 
