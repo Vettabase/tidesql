@@ -7,7 +7,7 @@
 set -eo pipefail
 
 MARIADB_PREFIX="${MARIADB_PREFIX:-/usr/local/mariadb}"
-DATADIR="${MARIADB_PREFIX}/data"
+DATADIR="${MARIADB_PREFIX}/data/default"
 
 # ── Initialise data directory if it has not been set up yet ────────────────
 if [ ! -d "${DATADIR}/mysql" ]; then
