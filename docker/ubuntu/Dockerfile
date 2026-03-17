@@ -2,8 +2,8 @@ FROM ubuntu:24.04
 
 # ── Build-time arguments ────────────────────────────────────────────────────
 # Override with --build-arg KEY=VALUE at docker build time.
-ARG MARIADB_VERSION=11.8
-ARG TIDESDB_VERSION=v8.8.0
+ARG MARIADB_VERSION
+ARG TIDESDB_VERSION
 ARG TIDESDB_PREFIX=/usr/local
 ARG MARIADB_PREFIX=/usr/local/mariadb
 # Set WITH_TESTS=1 to include the MariaDB + TidesDB test suite in the image.
