@@ -27,8 +27,7 @@ and some optional configuration files.
 
 ## Prerequisites
 
-  - Tested with Docker 28.2.2
-    and Podman 5.8
+  - Docker OR Podman (tested with Docker 28.2.2 and Podman 5.8)
   - An internet connection at build time to clone MariaDB and TidesDB sources
     from GitHub
 
