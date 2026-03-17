@@ -107,7 +107,6 @@ BUILD_ARGS=(
 docker build \
     -f "${REPO_ROOT}/docker/ubuntu/Dockerfile" \
     -t "${IMAGE_NAME}:${TAG}" \
-    --no-cache \
     "${BUILD_ARGS[@]}" \
     "${REPO_ROOT}"
 
