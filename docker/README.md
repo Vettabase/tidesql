@@ -1,13 +1,10 @@
-TIDESQL DOCKER IMAGES
-░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+# TIDESQL Docker Images
 
 This directory contains Dockerfiles for running TidesSQL (MariaDB + TidesDB
-storage engine) in a container.  Each subdirectory is named after the base OS
-and contains a self-contained Dockerfile together with a startup entrypoint.
+storage engine) in a container.
 
 
-TREE
-░░░░░░░░░░░░░░░░░░░░░░░░
+## Tree
 
 ```
 docker/
@@ -24,126 +21,102 @@ docker/
 └── setup.sh
 ```
 
-
-AVAILABLE IMAGES
-░░░░░░░░░░░░░░░░░░░░░░░░
-
-  ubuntu     MariaDB 11.8 on Ubuntu 24.04 (ubuntu:24.04)
+This tree will start to make sense when we add more operating systems (RedHat family, Arch)
+and some optional configuration files.
 
 
-PREREQUISITES
-░░░░░░░░░░░░░░░░░░░░░░░░
+## Prerequisites
 
-  - Docker 20.10 or later (BuildKit enabled by default from Docker 23+)
-    OR Podman 4.0 or later (see PODMAN section below)
+  - Tested with Docker 28.2.2
+    and Podman 5.8
   - An internet connection at build time to clone MariaDB and TidesDB sources
     from GitHub
 
 
-BUILDING AN IMAGE
-░░░░░░░░░░░░░░░░░░░░░░░░
+## Building Images
 
-All docker build commands must be run from the repository root so that the
-Dockerfile can COPY the tidesdb/ plugin source and the mysql-test/ test suite
-into the image.
+To make building less error-prone, the following scripts are available:
+- `docker/cleanpup.sh` removes the existing image, any container
+  created from it, and associated volumes.
+- `docker/build.sh` builds the image. This includes compiling MariaDB and
+  TidesDB so, depending on your hardware, can take 20-40 minutes. It also
+  creates a new container so that the image can be tested immediately.
+- `docker/rebuild.sh` calls both, passing all necessary environment
+  variable.
 
-  # Build the ubuntu image with default settings
-  docker build \
-      -f docker/ubuntu/Dockerfile \
-      --build-arg MARIADB_VERSION=11.8 \
-      --build-arg TIDESDB_VERSION=v8.8.0 \
-      -t tidesql:11.8-ubuntu \
-      .
-
-The build compiles MariaDB and TidesDB from source, so it typically takes
-20–40 minutes depending on available CPU cores.
-
-
-REBUILD SCRIPT
-░░░░░░░░░░░░░░░░░░░░░░░░
-
-docker/rebuild.sh automates a full clean rebuild: it removes any existing
-container, volumes, and image, builds a fresh image, starts a new container,
-and tails the logs.  It can be run from any directory:
-
-  bash /path/to/docker/rebuild.sh
-
-docker/cleanup.sh removes the container, volumes, and image without rebuilding.
-docker/setup.sh builds the image and starts the container without cleanup first.
-Both can be run independently from any directory.
+These scripts can be called from any path.
 
 Environment variables accepted by the scripts:
 
-  IMAGE_NAME        Image name                   (default: tidesql)
-  TAG               Image tag                    (default: 11.8-ubuntu)
-  CONTAINER_NAME    Container name               (default: tidesql)
-  MARIADB_VERSION   MariaDB branch/tag to build  (default: 11.8)
-  TIDESDB_VERSION   TidesDB release tag to build (default: latest from GitHub)
+- `IMAGE_NAME`: Name of the newly built image, default: tidesql
+- `TAG`: Image tag, default: 11.8-ubuntu
+- `CONTAINER_NAME`: Name of the container to be created, default: tidesql
+- `MARIADB_VERSION`: MariaDB version to build, default: 11.8
+- `TIDESDB_VERSION`: TidesDB release tag to build, default: latest from GitHub
+- `EXCLUDE_ENGINES`  Comma-separated list of optional engines to exclude from the
+  build.  Engine names are case-insensitive.  Use `ALL` to include all optional
+  engines.
+- `INCLUDE_ENGINES`: Comma-separated list of optional engines to include.
+  All other optional engines are excluded. Engine names are case-insensitive.
 
-  EXCLUDE_ENGINES  Comma-separated list of optional engines to exclude from the
-                   build.  Engine names are case-insensitive.  Use ALL to
-                   include all optional engines (same as leaving it unset).
-
-  INCLUDE_ENGINES  Comma-separated list of optional engines to include.  All
-                   other optional engines are excluded.  Engine names are
-                   case-insensitive.
-
-EXCLUDE_ENGINES and INCLUDE_ENGINES cannot be set at the same time.
+`EXCLUDE_ENGINES` and `INCLUDE_ENGINES` cannot be set at the same time.
 
 Optional engines that can be excluded or selectively included:
 
-  ARCHIVE, BLACKHOLE, CONNECT, EXAMPLE, FEDERATED, FEDERATEDX,
-  MROONGA, ROCKSDB, S3, SPHINX, SPIDER
+- ARCHIVE
+- BLACKHOLE
+- CONNECT
+- EXAMPLE
+- FEDERATED
+- FEDERATEDX
+- MROONGA
+- ROCKSDB
+- S3
+- SPHINX
+- SPIDER
 
-The following engines are always compiled in and cannot be excluded:
-TidesDB, InnoDB, Aria, MyISAM, SEQUENCE.
+TidesDB and some other engines are always compiled in and cannot be excluded.
 
 Specifying an engine name outside the optional list in either variable, or
-specifying an always-included engine in EXCLUDE_ENGINES, will cause the
-script to exit with an error before the build starts.
+specifying an always-included engine in `EXCLUDE_ENGINES`, will cause the
+script to exit with an error.
 
 Example — build without Mroonga and RocksDB:
 
-  EXCLUDE_ENGINES=Mroonga,RocksDB bash docker/rebuild.sh
+```
+EXCLUDE_ENGINES=Mroonga,RocksDB bash docker/rebuild.sh
+```
 
 Example — build with only Blackhole and RocksDB (all others excluded):
 
-  INCLUDE_ENGINES=BLACKHOLE,ROCKSDB bash docker/rebuild.sh
+```
+INCLUDE_ENGINES=BLACKHOLE,ROCKSDB bash docker/rebuild.sh
+```
 
-Example — build and run with a custom image name and tag:
+## Build Arguments
 
-  IMAGE_NAME=myrepo/tidesql TAG=dev bash docker/rebuild.sh
+The following build arguments are understood by the Dockerfile.
 
-Note: rebuild.sh always passes --no-cache to docker build, so every run
-performs a full from-scratch build.
+Some of them currently cannot be changed by using the scripts.
 
-
-BUILD ARGUMENTS
-░░░░░░░░░░░░░░░░░░░░░░░░
-
-Override any of the following with --build-arg KEY=VALUE:
-
-  MARIADB_VERSION   MariaDB branch or tag to build   (required; no default in Dockerfile)
-  TIDESDB_VERSION   TidesDB release tag to build     (required; no default in Dockerfile)
-  TIDESDB_PREFIX    TidesDB install prefix            (default: /usr/local)
-  MARIADB_PREFIX    MariaDB install prefix            (default: /usr/local/mariadb)
-  WITH_TESTS        Include test suite in image (1=yes, 0=no, default: 0)
-  DISABLED_ENGINES  Comma-separated list of optional storage engines to
-                    disable at compile time (e.g. MROONGA,ROCKSDB).
-                    Normally set indirectly via EXCLUDE_ENGINES /
+```
+  MARIADB_VERSION   MariaDB branch or tag to build    REQUIRED
+  TIDESDB_VERSION   TidesDB release tag to build      REQUIRED
+  TIDESDB_PREFIX    TidesDB install prefix            Default: /usr/local
+  MARIADB_PREFIX    MariaDB install prefix            Default: /usr/local/mariadb
+  WITH_TESTS        Include MTR in the image. 1=yes, 0=no. Default: 0
+  DISABLED_ENGINES  Normally set indirectly via EXCLUDE_ENGINES /
                     INCLUDE_ENGINES in rebuild.sh (see REBUILD SCRIPT above).
+```
 
-MARIADB_VERSION and TIDESDB_VERSION have no default in the Dockerfile and must
+`MARIADB_VERSION and TIDESDB_VERSION have no default in the Dockerfile and must
 always be supplied.  The scripts (rebuild.sh, setup.sh) default them to 11.8
 and the latest TidesDB release from GitHub respectively, so a bare
 "bash docker/rebuild.sh" works without any extra configuration.
 
-When WITH_TESTS=0 (default) the MariaDB mysql-test/ directory and the TidesDB
-test suite are removed from the final image, reducing its size.  Set
-WITH_TESTS=1 to keep them for development or CI use.
-
 Example — include the test suite:
 
+```
   docker build \
       -f docker/ubuntu/Dockerfile \
       --build-arg MARIADB_VERSION=11.8 \
@@ -151,10 +124,10 @@ Example — include the test suite:
       --build-arg WITH_TESTS=1 \
       -t tidesql:11.8-ubuntu-tests \
       .
+```
 
 
-RUNNING A CONTAINER
-░░░░░░░░░░░░░░░░░░░░░░░░
+## Running a Container
 
 Start a container with named volumes so data and configuration persist across
 restarts:
@@ -168,102 +141,61 @@ restarts:
       tidesql:11.8-ubuntu
 
 On the first start the entrypoint initialises the data directory
-(mariadb-install-db) before launching the server.  Subsequent starts reuse
+(mariadb-install-db) before launching the server. Subsequent starts reuse
 the existing data directory.
 
 The conf volume is initialised from the my.cnf baked into the image.  Mount a
 host directory there to supply your own configuration:
 
-  docker run -d \
-      --name tidesql \
-      -p 3306:3306 \
-      -v /path/to/your/conf:/etc/mysql \
-      -v tidesql-data:/usr/local/mariadb/data \
-      -v tidesql-log:/usr/local/mariadb/log \
-      tidesql:11.8-ubuntu
+Connect for the first time via the command line:
 
-Connect from the host:
+```
+docker exec -ti tidesql mariadb
+```
 
-  mariadb -h 127.0.0.1 -P 3306 -u root
-
-Connect from inside the container:
-
-  docker exec -it tidesql \
-      mariadb --socket=/tmp/mariadb.sock -u root
+Then, you can create users to connect from the outside.
 
 
-QUICK TEST
-░░░░░░░░░░░░░░░░░░░░░░░░
-
-  CREATE TABLE t (id INT PRIMARY KEY, data VARCHAR(100)) ENGINE=TidesDB;
-  INSERT INTO t VALUES (1, 'hello'), (2, 'world');
-  SELECT * FROM t;
-  DROP TABLE t;
+## Quick Test
 
 Verify the TidesDB plugin is loaded:
 
-  SHOW PLUGINS;
+```
+SHOW ENGINE TIDESDB STATUS;
+```
 
-If it is not loaded automatically:
+And now, you can play with it!
 
-  INSTALL SONAME 'ha_tidesdb';
+```
+CREATE SCHEMA IF NOT EXISTS test;
+CREATE TABLE person (id INT UNSIGNED AUTO_INCREMENT PRIMARY KEY, full_name VARCHAR(100)) ENGINE=TidesDB;
+START TRANSACTION;
+INSERT INTO person (id, full_name) VALUES (DEFAULT, 'Invisible Man');
+ROLLBACK;
+SELECT * FROM person;
+SET TRANSACTION ISOLATION LEVEL READ COMMITTED;
+START TRANSACTION;
+INSERT INTO person (id, full_name) VALUES
+    (DEFAULT, 'Tom Baker'),
+    (DEFAULT, 'Leonard Nimoy');
+SELECT * FROM person;
+COMMIT;
+SELECT * FROM person;
+```
 
+## Stopping and Removing the Container
 
-RUN TEST SUITE
-░░░░░░░░░░░░░░░░░░░░░░░░
+```
+docker stop tidesql
+docker rm   tidesql
+docker volume rm tidesql-conf tidesql-data tidesql-log
+```
 
-Requires an image built with WITH_TESTS=1.  Run the TidesDB suite:
+## To Do
 
-  docker exec -it tidesql bash -c \
-      "cd /usr/local/mariadb/mysql-test && \
-       perl mtr --suite=tidesdb --parallel=4 --force"
+- Automatically create any number of containers (including zero)
+- Support more systems
+- Support all MariaDB Long-Term Support versions and some rolling versions
+- Anonymous volume containing SQL scripts to run on startup
+- Optionally create a test schema
 
-
-PODMAN
-░░░░░░░░░░░░░░░░░░░░░░░░
-
-The images can be built and run with rootless Podman without any changes to
-the Dockerfile or entrypoint.  Podman's CLI is compatible with Docker for all
-operations used here.
-
-Build:
-
-  podman build \
-      -f docker/ubuntu/Dockerfile \
-      --build-arg MARIADB_VERSION=11.8 \
-      --build-arg TIDESDB_VERSION=v8.8.0 \
-      -t tidesql:11.8-ubuntu \
-      .
-
-Run:
-
-  podman run -d \
-      --name tidesql \
-      -p 3306:3306 \
-      -v tidesql-conf:/etc/mysql \
-      -v tidesql-data:/usr/local/mariadb/data \
-      -v tidesql-log:/usr/local/mariadb/log \
-      tidesql:11.8-ubuntu
-
-Connect from the host:
-
-  mariadb -h 127.0.0.1 -P 3306 -u root
-
-Connect from inside the container:
-
-  podman exec -it tidesql \
-      mariadb --socket=/tmp/mariadb.sock -u root
-
-Stop and remove:
-
-  podman stop tidesql
-  podman rm   tidesql
-  podman volume rm tidesql-conf tidesql-data tidesql-log
-
-
-STOPPING AND REMOVING
-░░░░░░░░░░░░░░░░░░░░░░░░
-
-  docker stop tidesql
-  docker rm   tidesql
-  docker volume rm tidesql-conf tidesql-data tidesql-log   # removes persistent data — irreversible
