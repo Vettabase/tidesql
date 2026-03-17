@@ -132,6 +132,7 @@ Example — include the test suite:
 Start a container with named volumes so data and configuration persist across
 restarts:
 
+```
   docker run -d \
       --name tidesql \
       -p 3306:3306 \
@@ -139,6 +140,7 @@ restarts:
       -v tidesql-data:/usr/local/mariadb/data \
       -v tidesql-log:/usr/local/mariadb/log \
       tidesql:11.8-ubuntu
+```
 
 On the first start the entrypoint initialises the data directory
 (mariadb-install-db) before launching the server. Subsequent starts reuse
