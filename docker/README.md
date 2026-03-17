@@ -192,6 +192,26 @@ docker rm   tidesql
 docker volume rm tidesql-conf tidesql-data tidesql-log
 ```
 
+## MariaDB Tree
+
+MariaDB is installed in `/usr/local/mariadb`.
+
+We configured MariaDB to use a clean directory tree:
+
+```
+/usr/local/mariadb
+├── data
+│   └── default        (regular storage engines write here)
+|   └── tidesdb-data   (TidesDB data files and LOG)
+└── log
+    ├── binlog files
+    ├── error.log
+    ├── slow.log
+    ├── general.log
+    └── sqlerr.log     (SQL Error Log)
+```
+
+
 ## To Do
 
 - Automatically create any number of containers (including zero)
