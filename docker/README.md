@@ -4,6 +4,13 @@ This directory contains Dockerfiles for running TidesSQL (MariaDB + TidesDB
 storage engine) in a container.
 
 
+## Prerequisites
+
+  - Docker OR Podman (tested with Docker 28.2.2 and Podman 5.8)
+  - An internet connection at build time to clone MariaDB and TidesDB sources
+    from GitHub
+
+
 ## Tree
 
 ```
@@ -23,13 +30,6 @@ docker/
 
 This tree will start to make sense when we add more operating systems (RedHat family, Arch)
 and some optional configuration files.
-
-
-## Prerequisites
-
-  - Docker OR Podman (tested with Docker 28.2.2 and Podman 5.8)
-  - An internet connection at build time to clone MariaDB and TidesDB sources
-    from GitHub
 
 
 ## Building Images
