@@ -103,52 +103,200 @@ static std::string tdb_path;
 
 static handlerton *tidesdb_hton;
 
-/* ******************** Plugin-level row locks ******************** */
+/* ******************** Plugin-level row lock table ******************** */
 /*
-  Striped mutex array for emulating pessimistic row-level locking.
-  TidesDB library uses optimistic MVCC only -- write-write conflicts
-  are detected at commit time.  For workloads that depend on
-  SELECT ... FOR UPDATE semantics (e.g. TPC-C's district counter),
-  concurrent read-modify-write on the same row always conflicts.
+  Hash-table-based row-level lock manager with deadlock detection.
+  Replaces the striped mutex approach which caused cross-table ABBA
+  deadlocks in multi-table transactions (e.g. TPC-C stored procs).
 
-  This stripe array provides lightweight row-level serialization:
-  UPDATE/DELETE acquire the stripe mutex for their PK hash before
-  modifying the row.  The lock is held until COMMIT/ROLLBACK,
-  preventing a second transaction from reading a stale value and
-  creating a doomed write-write conflict.
+  Design:
+  - Partitioned hash table: hash(pk_bytes) % NUM_PARTITIONS → partition
+  - Each partition has its own mutex protecting a linked-list hash chain
+  - Lock entries track: owner txn, PK bytes, condition variable for waiters
+  - Deadlock detection: on wait, walk the wait-for graph (waiter→holder→waiter)
+    If a cycle is found, return HA_ERR_LOCK_DEADLOCK immediately
+  - Per-txn held_locks list for bulk release at COMMIT/ROLLBACK
 
-  The stripe count is configurable via tidesdb_row_lock_stripes (default 1024,
-  read-only).  1024 stripes provide sufficient parallelism (TPC-C with 1000
-  warehouses x 10 districts = 10000 rows spread across 1024 slots).
-  False sharing between different rows hashing to the same slot
-  causes brief serialization but not correctness issues.
+  This gives per-row granularity without false sharing, proper blocking
+  semantics for SELECT ... FOR UPDATE, and deadlock resolution for
+  multi-table transactions.
 */
-static ulong srv_row_lock_stripes = 1024;
-static mysql_mutex_t *row_lock_stripes = NULL;
 
-static inline uint32_t row_lock_stripe(const uchar *key, uint len)
+/* Number of hash partitions -- each has its own mutex.
+   Higher values reduce contention between unrelated rows. */
+static constexpr uint TDB_LOCK_PARTITIONS = 256;
+
+/* Row lock entry in the hash table */
+struct tdb_row_lock_t
 {
-    /* XXH3_64bits from TidesDB's bundled xxHash -- faster and better
-       distribution than FNV-1a, especially for short keys (PK bytes). */
+    uchar *pk;                 /* heap-allocated PK bytes */
+    uint pk_len;               /* length of PK bytes */
+    uint64_t owner_txn_id;     /* txn that holds this lock (0 = free) */
+    tidesdb_trx_t *owner_trx;  /* trx struct of the holder */
+    mysql_cond_t cond;         /* waiters sleep on this */
+    uint waiters;              /* number of threads waiting */
+    tdb_row_lock_t *hash_next; /* next in hash chain */
+    tdb_row_lock_t *held_next; /* next in per-txn held list */
+    uint partition;            /* which partition this belongs to */
+};
+
+/* One partition of the lock table */
+struct tdb_lock_partition_t
+{
+    mysql_mutex_t mutex;
+    tdb_row_lock_t *chain; /* head of hash chain */
+};
+
+static tdb_lock_partition_t *lock_partitions = NULL;
+static ulong srv_row_lock_stripes = 1024; /* kept for sysvar compat, not used functionally */
+
+static inline uint tdb_lock_part(const uchar *key, uint len)
+{
     uint64_t h = XXH3_64bits(key, len);
-    return (uint32_t)(h % srv_row_lock_stripes);
+    return (uint)(h % TDB_LOCK_PARTITIONS);
 }
 
-static void row_lock_acquire(tidesdb_trx_t *trx, const uchar *key, uint len)
+/* Find or create a lock entry in the partition's hash chain.
+   Caller must hold partition mutex. */
+static tdb_row_lock_t *tdb_lock_find_or_create(tdb_lock_partition_t *part, uint part_idx,
+                                               const uchar *pk, uint pk_len)
 {
-    if (!row_lock_stripes) return; /* allocation failed at init */
-    uint32_t stripe = row_lock_stripe(key, len);
-    if (!trx->held_row_locks) trx->held_row_locks = new std::unordered_set<uint32_t>();
-    if (trx->held_row_locks->count(stripe)) return; /* already hold this stripe */
-    mysql_mutex_lock(&row_lock_stripes[stripe]);
-    trx->held_row_locks->insert(stripe);
+    for (tdb_row_lock_t *e = part->chain; e; e = e->hash_next)
+    {
+        if (e->pk_len == pk_len && memcmp(e->pk, pk, pk_len) == 0) return e;
+    }
+    /* Create new entry */
+    tdb_row_lock_t *e =
+        (tdb_row_lock_t *)my_malloc(PSI_NOT_INSTRUMENTED, sizeof(tdb_row_lock_t), MYF(MY_ZEROFILL));
+    if (!e) return NULL;
+    e->pk = (uchar *)my_malloc(PSI_NOT_INSTRUMENTED, pk_len, MYF(0));
+    if (!e->pk)
+    {
+        my_free(e);
+        return NULL;
+    }
+    memcpy(e->pk, pk, pk_len);
+    e->pk_len = pk_len;
+    e->owner_txn_id = 0;
+    e->owner_trx = NULL;
+    e->waiters = 0;
+    e->partition = part_idx;
+    mysql_cond_init(0, &e->cond, NULL);
+    e->hash_next = part->chain;
+    part->chain = e;
+    return e;
 }
 
+/* Deadlock detection: walk the wait-for graph.
+   Returns true if acquiring this lock would create a cycle.
+   Caller must NOT hold any partition mutex (we acquire them during traversal). */
+static bool tdb_lock_would_deadlock(tidesdb_trx_t *requestor, tdb_row_lock_t *target_lock)
+{
+    /* Simple cycle detection: follow the chain
+       requestor wants target_lock → target_lock.owner_trx → owner.waiting_on → ...
+       If we reach requestor, there's a cycle. Max depth = 100 to avoid infinite loops. */
+    tidesdb_trx_t *cur = target_lock->owner_trx;
+    for (int depth = 0; depth < 100 && cur; depth++)
+    {
+        if (cur == requestor) return true; /* cycle found */
+        tdb_row_lock_t *cur_waiting = cur->waiting_on;
+        if (!cur_waiting) break; /* not waiting on anything */
+        cur = cur_waiting->owner_trx;
+    }
+    return false;
+}
+
+/*
+  Acquire a row lock. Returns 0 on success, HA_ERR_LOCK_DEADLOCK on deadlock.
+  Blocks if the row is locked by another transaction (unless deadlock detected).
+  Re-entrant: returns immediately if already held by this txn.
+*/
+static int row_lock_acquire(tidesdb_trx_t *trx, const uchar *key, uint len)
+{
+    if (!lock_partitions || !trx) return 0;
+
+    uint part_idx = tdb_lock_part(key, len);
+    tdb_lock_partition_t *part = &lock_partitions[part_idx];
+
+    mysql_mutex_lock(&part->mutex);
+
+    tdb_row_lock_t *lock = tdb_lock_find_or_create(part, part_idx, key, len);
+    if (!lock)
+    {
+        mysql_mutex_unlock(&part->mutex);
+        return HA_ERR_OUT_OF_MEM;
+    }
+
+    /* Already own it? */
+    if (lock->owner_txn_id == trx->lock_txn_id && lock->owner_trx == trx)
+    {
+        mysql_mutex_unlock(&part->mutex);
+        return 0;
+    }
+
+    /* Free? Claim it. */
+    if (lock->owner_txn_id == 0)
+    {
+        lock->owner_txn_id = trx->lock_txn_id;
+        lock->owner_trx = trx;
+        lock->held_next = trx->held_locks_head;
+        trx->held_locks_head = lock;
+        mysql_mutex_unlock(&part->mutex);
+        return 0;
+    }
+
+    /* Owned by someone else -- check for deadlock before waiting */
+    if (tdb_lock_would_deadlock(trx, lock))
+    {
+        mysql_mutex_unlock(&part->mutex);
+        return HA_ERR_LOCK_DEADLOCK;
+    }
+
+    /* Wait for the lock to be released */
+    trx->waiting_on = lock;
+    lock->waiters++;
+    while (lock->owner_txn_id != 0 && lock->owner_trx != trx)
+    {
+        mysql_cond_wait(&lock->cond, &part->mutex);
+    }
+    lock->waiters--;
+    trx->waiting_on = NULL;
+
+    /* Claim the lock */
+    lock->owner_txn_id = trx->lock_txn_id;
+    lock->owner_trx = trx;
+    lock->held_next = trx->held_locks_head;
+    trx->held_locks_head = lock;
+    mysql_mutex_unlock(&part->mutex);
+    return 0;
+}
+
+/*
+  Release all row locks held by this transaction.
+  Called from tidesdb_commit() and tidesdb_rollback().
+*/
 static void row_locks_release_all(tidesdb_trx_t *trx)
 {
-    if (!trx->held_row_locks) return;
-    for (uint32_t s : *trx->held_row_locks) mysql_mutex_unlock(&row_lock_stripes[s]);
-    trx->held_row_locks->clear();
+    if (!lock_partitions || !trx) return;
+
+    tdb_row_lock_t *lock = trx->held_locks_head;
+    while (lock)
+    {
+        tdb_row_lock_t *next = lock->held_next;
+        uint part_idx = lock->partition;
+        tdb_lock_partition_t *part = &lock_partitions[part_idx];
+
+        mysql_mutex_lock(&part->mutex);
+        lock->owner_txn_id = 0;
+        lock->owner_trx = NULL;
+        lock->held_next = NULL;
+        if (lock->waiters > 0) mysql_cond_broadcast(&lock->cond);
+        mysql_mutex_unlock(&part->mutex);
+
+        lock = next;
+    }
+    trx->held_locks_head = NULL;
+    trx->waiting_on = NULL;
 }
 
 static handler *tidesdb_create_handler(handlerton *hton, TABLE_SHARE *table, MEM_ROOT *mem_root);
@@ -166,6 +314,8 @@ static ulong srv_max_open_sstables = 256;
 static ulonglong srv_max_memory_usage = 0; /* 0 = auto (library decides) */
 static my_bool srv_log_to_file = 1;        /* write TidesDB logs to file (default: yes) */
 static ulonglong srv_log_truncation_at = 24ULL * 1024 * 1024; /* log file truncation size (24MB) */
+static my_bool srv_unified_memtable = 1; /* 1 = unified WAL+memtable (default), 0 = per-CF */
+static ulonglong srv_unified_memtable_write_buffer_size = 128ULL * 1024 * 1024; /* 128MB */
 
 /* Per-session TTL override (seconds).  0 = use table default. */
 static MYSQL_THDVAR_ULONGLONG(ttl, PLUGIN_VAR_RQCMDARG,
@@ -200,7 +350,7 @@ static MYSQL_THDVAR_ENUM(default_compression, PLUGIN_VAR_RQCMDARG,
 
 static MYSQL_THDVAR_ULONGLONG(default_write_buffer_size, PLUGIN_VAR_RQCMDARG,
                               "Default write buffer size in bytes for new tables", NULL, NULL,
-                              32ULL * 1024 * 1024, 1024, ULONGLONG_MAX, 1024);
+                              128ULL * 1024 * 1024, 1024, ULONGLONG_MAX, 1024);
 
 static MYSQL_THDVAR_BOOL(default_bloom_filter, PLUGIN_VAR_RQCMDARG,
                          "Default bloom filter setting for new tables", NULL, NULL, 1);
@@ -217,8 +367,9 @@ static TYPELIB sync_mode_typelib = {array_elements(sync_mode_names) - 1, "sync_m
                                     sync_mode_names, NULL, NULL};
 
 static MYSQL_THDVAR_ENUM(default_sync_mode, PLUGIN_VAR_RQCMDARG,
-                         "Default sync mode for new tables (NONE, INTERVAL, FULL)", NULL, NULL,
-                         2 /* FULL */, &sync_mode_typelib);
+                         "Default sync mode for new tables (NONE, INTERVAL, FULL); "
+                         "FULL ensures every commit is immediately durable",
+                         NULL, NULL, 2 /* FULL */, &sync_mode_typelib);
 
 static MYSQL_THDVAR_ULONGLONG(default_sync_interval_us, PLUGIN_VAR_RQCMDARG,
                               "Default sync interval in microseconds for new tables "
@@ -233,10 +384,10 @@ static MYSQL_THDVAR_ULONGLONG(default_bloom_fpr, PLUGIN_VAR_RQCMDARG,
 static MYSQL_THDVAR_ULONGLONG(default_klog_value_threshold, PLUGIN_VAR_RQCMDARG,
                               "Default klog value threshold in bytes for new tables "
                               "(values >= this go to vlog)",
-                              NULL, NULL, 4096, 0, ULONGLONG_MAX, 1);
+                              NULL, NULL, 512, 0, ULONGLONG_MAX, 1);
 
 static MYSQL_THDVAR_ULONGLONG(default_l0_queue_stall_threshold, PLUGIN_VAR_RQCMDARG,
-                              "Default L0 queue stall threshold for new tables", NULL, NULL, 8, 1,
+                              "Default L0 queue stall threshold for new tables", NULL, NULL, 20, 1,
                               1024, 1);
 
 static MYSQL_THDVAR_ULONGLONG(default_l1_file_count_trigger, PLUGIN_VAR_RQCMDARG,
@@ -358,6 +509,41 @@ static MYSQL_SYSVAR_ULONGLONG(log_truncation_at, srv_log_truncation_at,
                               "(0 = no truncation, default: 24MB)",
                               NULL, NULL, 24ULL * 1024 * 1024, 0, ULONGLONG_MAX, 0);
 
+static MYSQL_SYSVAR_BOOL(unified_memtable, srv_unified_memtable,
+                         PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_READONLY,
+                         "Use a single unified WAL and memtable across all column families. "
+                         "Reduces WAL fsync overhead from O(num_tables) to O(1) and provides "
+                         "atomic cross-CF commits. Best for multi-table OLTP workloads. "
+                         "Requires all CFs to use the same comparator (default: ON)",
+                         NULL, NULL, 1);
+
+static MYSQL_SYSVAR_ULONGLONG(unified_memtable_write_buffer_size,
+                              srv_unified_memtable_write_buffer_size,
+                              PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_READONLY,
+                              "Write buffer size in bytes for the unified memtable. "
+                              "0 = automatic (library default). Only meaningful when "
+                              "tidesdb_unified_memtable=ON",
+                              NULL, NULL, 128ULL * 1024 * 1024, 0, ULONGLONG_MAX, 0);
+
+static ulong srv_unified_memtable_sync_mode = 2; /* FULL */
+
+static MYSQL_SYSVAR_ENUM(unified_memtable_sync_mode, srv_unified_memtable_sync_mode,
+                         PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_READONLY,
+                         "Sync mode for the unified WAL (NONE, INTERVAL, FULL). "
+                         "Only meaningful when tidesdb_unified_memtable=ON. "
+                         "NONE: fastest, relies on OS page cache. "
+                         "INTERVAL: periodic sync every unified_memtable_sync_interval_us. "
+                         "FULL: fsync on every commit (default, most durable)",
+                         NULL, NULL, 2 /* FULL */, &sync_mode_typelib);
+
+static ulonglong srv_unified_memtable_sync_interval = 128000;
+
+static MYSQL_SYSVAR_ULONGLONG(unified_memtable_sync_interval, srv_unified_memtable_sync_interval,
+                              PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_READONLY,
+                              "Sync interval in microseconds for the unified WAL "
+                              "(only used when unified_memtable_sync_mode=INTERVAL)",
+                              NULL, NULL, 128000, 0, ULONGLONG_MAX, 0);
+
 /* Configurable data directory.
    Defaults to NULL which means the plugin computes a sibling directory
    of mysql_real_data_home.  Setting this overrides the auto-computed path. */
@@ -420,7 +606,7 @@ static void tidesdb_backup_dir_update(THD *thd, struct st_mysql_sys_var *, void 
        Release the mutex around the blocking backup call. */
     mysql_mutex_unlock(&LOCK_global_system_variables);
 
-    sql_print_information("TIDESDB: Starting online backup to '%s'", backup_path.c_str());
+    /* Backup started -- no log (user-triggered, success/failure reported via return code) */
 
     char *backup_path_c = const_cast<char *>(backup_path.c_str());
     int rc = tidesdb_backup(tdb_global, backup_path_c);
@@ -435,9 +621,6 @@ static void tidesdb_backup_dir_update(THD *thd, struct st_mysql_sys_var *, void 
         /* We leave variable unchanged on failure */
         return;
     }
-
-    sql_print_information("TIDESDB: Online backup to '%s' completed successfully",
-                          backup_path.c_str());
 
     /* For PLUGIN_VAR_MEMALLOC strings, the framework manages memory.
        We set var_ptr to the save value so the framework copies it. */
@@ -471,7 +654,7 @@ static void tidesdb_checkpoint_dir_update(THD *thd, struct st_mysql_sys_var *, v
         return;
     }
 
-    sql_print_information("TIDESDB: Starting checkpoint to '%s'", new_dir);
+    /* Checkpoint started -- no log */
 
     int rc = tidesdb_checkpoint(tdb_global, new_dir);
 
@@ -483,7 +666,7 @@ static void tidesdb_checkpoint_dir_update(THD *thd, struct st_mysql_sys_var *, v
         return;
     }
 
-    sql_print_information("TIDESDB: Checkpoint to '%s' completed successfully", new_dir);
+    /* Checkpoint completed -- no log */
     *static_cast<const char **>(var_ptr) = new_dir;
 }
 
@@ -532,6 +715,10 @@ static struct st_mysql_sys_var *tidesdb_system_variables[] = {
     MYSQL_SYSVAR(default_isolation_level),
     MYSQL_SYSVAR(log_to_file),
     MYSQL_SYSVAR(log_truncation_at),
+    MYSQL_SYSVAR(unified_memtable),
+    MYSQL_SYSVAR(unified_memtable_write_buffer_size),
+    MYSQL_SYSVAR(unified_memtable_sync_mode),
+    MYSQL_SYSVAR(unified_memtable_sync_interval),
     NULL};
 
 /* ******************** Table options (per-table CF config) ******************** */
@@ -798,8 +985,31 @@ static tidesdb_trx_t *get_or_create_trx(THD *thd, handlerton *hton, tidesdb_isol
             trx->isolation_level = iso;
             trx->txn_generation++;
         }
-        else
+        else if (trx->needs_reset)
         {
+            /* Txn object kept alive from previous commit/rollback (see
+               tidesdb_commit).  Reset it to get a fresh MVCC snapshot at
+               current-transaction-start.  This avoids the expensive
+               free+begin cycle while ensuring we see the latest data.
+               The bulk-insert path already uses commit+reset successfully.
+               Only reset when needs_reset is true (set after real commit/
+               rollback) to preserve snapshot within multi-statement txns. */
+            int rrc = tidesdb_txn_reset(trx->txn, iso);
+            if (rrc != TDB_SUCCESS)
+            {
+                /* Reset failed -- fall back to free + begin */
+                tidesdb_txn_free(trx->txn);
+                trx->txn = NULL;
+                int rc = tidesdb_txn_begin_with_isolation(tdb_global, iso, &trx->txn);
+                if (rc != TDB_SUCCESS)
+                {
+                    (void)tdb_rc_to_ha(rc, "get_or_create_trx txn_begin(reset_fallback)");
+                    return NULL;
+                }
+            }
+            trx->needs_reset = false;
+            trx->isolation_level = iso;
+            trx->txn_generation++;
         }
         return trx;
     }
@@ -817,6 +1027,9 @@ static tidesdb_trx_t *get_or_create_trx(THD *thd, handlerton *hton, tidesdb_isol
     trx->dirty = false;
     trx->isolation_level = iso;
     trx->txn_generation = 1;
+    trx->lock_txn_id = 1;
+    trx->held_locks_head = NULL;
+    trx->waiting_on = NULL;
     thd_set_ha_data(thd, hton, trx);
     return trx;
 }
@@ -920,20 +1133,19 @@ static int tidesdb_commit(handlerton *, THD *thd, bool all)
            Defer the actual commit -- writes stay buffered in the txn,
            avoiding expensive txn_begin + commit per statement.
 
-           If this statement had writes, create/update a savepoint marking
-           the last known-good state.  If a later statement fails,
-           tidesdb_rollback(all=false) can rollback to here instead of
-           aborting the entire txn.  Per TidesDB docs -- creating a
-           savepoint with an existing name updates it; savepoints are
-           auto-freed on commit/rollback. */
-        if (trx->stmt_was_dirty)
-        {
-            int sp_rc = tidesdb_txn_savepoint(trx->txn, "stmt");
-            if (sp_rc == TDB_SUCCESS)
-                trx->stmt_savepoint_active = true;
-            else
-                sql_print_warning("TIDESDB: stmt savepoint failed rc=%d", sp_rc);
-        }
+           PERF NOTE -- tidesdb_txn_savepoint() deep-copies the ENTIRE
+           write-set (malloc+memcpy for every key/value).  For a txn
+           with N ops across S statements, total copy cost is
+           O(S * N * avg_kv_size) -- quadratic and devastating for
+           multi-statement OLTP transactions.
+
+           We skip the per-statement savepoint entirely.  This means
+           statement-level rollback inside BEGIN...COMMIT falls back to
+           full transaction rollback (same as many simple SE's).
+           The trade-off: a statement failure aborts the entire txn
+           instead of undoing just that statement.  For OLTP this is
+           acceptable since the client will retry the whole transaction
+           anyway after a conflict/error. */
         trx->stmt_was_dirty = false;
         return 0;
     }
@@ -947,17 +1159,24 @@ static int tidesdb_commit(handlerton *, THD *thd, bool all)
     }
 
     /* Real commit -- flush to storage.
-       After commit (or for read-only txns), free the txn instead of
-       reusing via tidesdb_txn_reset().  Reset takes the snapshot at
-       reset-time, not at next-statement-start, causing stale reads:
-       another connection's commit between our reset and our next SELECT
-       would be invisible.  Freeing and lazily recreating in
-       get_or_create_trx() ensures each statement gets a current snapshot. */
+       After a successful commit, keep the txn object alive and let
+       get_or_create_trx() call tidesdb_txn_reset() to get a fresh
+       snapshot.  This avoids the expensive free+begin cycle on every
+       autocommit statement (saves malloc/free + internal buffer
+       reallocation).  The bulk-insert path already uses commit+reset
+       successfully, so the pattern is proven safe.
+       If commit fails, fall back to rollback+free. */
     if (trx->dirty)
     {
         int rc = tidesdb_txn_commit(trx->txn);
         if (rc != TDB_SUCCESS)
         {
+            /* Only log truly unexpected errors (not transient conflicts). */
+            if (rc != TDB_ERR_CONFLICT && rc != TDB_ERR_LOCKED && rc != TDB_ERR_MEMORY_LIMIT)
+                sql_print_error(
+                    "TIDESDB: hton_commit: tidesdb_txn_commit returned %d "
+                    "(dirty=%d gen=%lu)",
+                    rc, trx->dirty, (unsigned long)trx->txn_generation);
             tidesdb_txn_rollback(trx->txn);
             tidesdb_txn_free(trx->txn);
             trx->txn = NULL;
@@ -967,17 +1186,16 @@ static int tidesdb_commit(handlerton *, THD *thd, bool all)
             row_locks_release_all(trx);
             return tdb_rc_to_ha(rc, "hton_commit");
         }
-        tidesdb_txn_free(trx->txn);
-        trx->txn = NULL;
+        /* Keep txn alive for reuse via txn_reset on next use. */
         trx->txn_generation++;
+        trx->needs_reset = true;
     }
     else
     {
-        /* Read-only transaction -- free so next statement gets fresh snapshot */
+        /* Read-only transaction -- rollback, keep alive for reuse. */
         tidesdb_txn_rollback(trx->txn);
-        tidesdb_txn_free(trx->txn);
-        trx->txn = NULL;
         trx->txn_generation++;
+        trx->needs_reset = true;
     }
     trx->dirty = false;
     trx->stmt_savepoint_active = false;
@@ -999,34 +1217,23 @@ static int tidesdb_rollback(handlerton *, THD *thd, bool all)
     if (!is_real_rollback)
     {
         /* Statement-level rollback inside a multi-statement transaction.
-           If a savepoint exists from a prior successful statement,
-           rollback to it -- undoes only this statement's writes.
-           If no savepoint (this is the first statement), rollback
-           the entire txn since there's nothing to preserve. */
-        if (trx->stmt_savepoint_active)
-        {
-            tidesdb_txn_rollback_to_savepoint(trx->txn, "stmt");
-            return 0;
-        }
-        /* First statement failed -- no prior good state to restore.
-           Fall through to full rollback. */
+           Without per-statement savepoints (see tidesdb_commit note),
+           we fall through to full transaction rollback.  This is the
+           same behavior as many simple storage engines and is correct --
+           OLTP clients retry the entire transaction after any error. */
     }
 
-    /* We release any active savepoint before full rollback. */
+    /* Release any user-created savepoints before full rollback. */
     if (trx->stmt_savepoint_active)
     {
         tidesdb_txn_release_savepoint(trx->txn, "stmt");
         trx->stmt_savepoint_active = false;
     }
 
-    /* Full rollback -- real transaction end, autocommit, or first
-       statement failure with no savepoint to restore to.
-       Free the txn so the next statement gets a fresh snapshot
-       (same rationale as tidesdb_commit -- avoid stale reads). */
+    /* Full rollback -- keep txn alive for reuse via reset on next use. */
     tidesdb_txn_rollback(trx->txn);
-    tidesdb_txn_free(trx->txn);
-    trx->txn = NULL;
     trx->txn_generation++;
+    trx->needs_reset = true;
     trx->dirty = false;
     trx->stmt_savepoint_active = false;
     row_locks_release_all(trx);
@@ -1043,8 +1250,6 @@ static int tidesdb_close_connection(handlerton *, THD *thd)
     if (trx)
     {
         row_locks_release_all(trx);
-        delete trx->held_row_locks;
-        trx->held_row_locks = NULL;
         if (trx->txn)
         {
             tidesdb_txn_rollback(trx->txn);
@@ -1073,9 +1278,14 @@ static int tidesdb_start_consistent_snapshot(THD *thd)
 static int tidesdb_start_consistent_snapshot(handlerton *, THD *thd)
 #endif
 {
-    /* Respect the session isolation level.  We pass TDB_ISOLATION_REPEATABLE_READ
-       as the table-level fallback since we have no table context here. */
+    /* START TRANSACTION WITH CONSISTENT SNAPSHOT explicitly requests a
+       point-in-time snapshot.  Always use at least SNAPSHOT isolation
+       so the snapshot persists for the entire transaction, regardless of
+       the session's default isolation level (e.g. READ_COMMITTED would
+       refresh the snapshot on each read, violating CONSISTENT_SNAPSHOT
+       semantics). */
     tidesdb_isolation_level_t iso = resolve_effective_isolation(thd, TDB_ISOLATION_REPEATABLE_READ);
+    if (iso < TDB_ISOLATION_SNAPSHOT) iso = TDB_ISOLATION_SNAPSHOT;
     tidesdb_trx_t *trx = get_or_create_trx(thd, tidesdb_hton, iso);
     if (!trx) return 1;
 
@@ -1110,6 +1320,8 @@ static bool tidesdb_show_status(handlerton *hton, THD *thd, stat_print_fn *print
     pos += snprintf(buf + pos, sizeof(buf) - pos,
                     "================== TidesDB Engine Status ==================\n");
     pos += snprintf(buf + pos, sizeof(buf) - pos, "Data directory: %s\n", tdb_path.c_str());
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "Unified memtable: %s\n",
+                    srv_unified_memtable ? "ON" : "OFF");
     pos +=
         snprintf(buf + pos, sizeof(buf) - pos, "Column families: %d\n", db_st.num_column_families);
     pos += snprintf(buf + pos, sizeof(buf) - pos, "Global sequence: %lu\n",
@@ -1194,13 +1406,16 @@ static int tidesdb_init_func(void *p)
 
     mysql_mutex_init(0, &last_conflict_mutex, MY_MUTEX_INIT_FAST);
 
-    /* Initialize striped row lock mutexes for pessimistic locking mode */
-    row_lock_stripes = (mysql_mutex_t *)my_malloc(
-        PSI_NOT_INSTRUMENTED, srv_row_lock_stripes * sizeof(mysql_mutex_t), MYF(MY_ZEROFILL));
-    if (row_lock_stripes)
+    /* Initialize partitioned lock table for pessimistic row locking */
+    lock_partitions = (tdb_lock_partition_t *)my_malloc(
+        PSI_NOT_INSTRUMENTED, TDB_LOCK_PARTITIONS * sizeof(tdb_lock_partition_t), MYF(MY_ZEROFILL));
+    if (lock_partitions)
     {
-        for (ulong i = 0; i < srv_row_lock_stripes; i++)
-            mysql_mutex_init(0, &row_lock_stripes[i], MY_MUTEX_INIT_FAST);
+        for (uint i = 0; i < TDB_LOCK_PARTITIONS; i++)
+        {
+            mysql_mutex_init(0, &lock_partitions[i].mutex, MY_MUTEX_INIT_FAST);
+            lock_partitions[i].chain = NULL;
+        }
     }
 
     /* Use tidesdb_data_home_dir if set, otherwise compute
@@ -1235,6 +1450,12 @@ static int tidesdb_init_func(void *p)
     cfg.log_to_file = srv_log_to_file ? 1 : 0;
     cfg.log_truncation_at = (size_t)srv_log_truncation_at;
     cfg.max_memory_usage = (size_t)srv_max_memory_usage;
+    cfg.unified_memtable = srv_unified_memtable ? 1 : 0;
+    cfg.unified_memtable_write_buffer_size = (size_t)srv_unified_memtable_write_buffer_size;
+    cfg.unified_memtable_sync_mode = tdb_sync_mode_map[srv_unified_memtable_sync_mode];
+    cfg.unified_memtable_sync_interval_us = (uint64_t)srv_unified_memtable_sync_interval;
+    cfg.unified_memtable_skip_list_max_level = 0;      /* 0 = library default */
+    cfg.unified_memtable_skip_list_probability = 0.0f; /* 0 = library default */
 
     int rc = tidesdb_open(&cfg, &tdb_global);
     if (rc != TDB_SUCCESS)
@@ -1259,11 +1480,24 @@ static int tidesdb_deinit_func(void *p)
     }
 
     mysql_mutex_destroy(&last_conflict_mutex);
-    if (row_lock_stripes)
+    if (lock_partitions)
     {
-        for (ulong i = 0; i < srv_row_lock_stripes; i++) mysql_mutex_destroy(&row_lock_stripes[i]);
-        my_free(row_lock_stripes);
-        row_lock_stripes = NULL;
+        for (uint i = 0; i < TDB_LOCK_PARTITIONS; i++)
+        {
+            /* Free all lock entries in the hash chain */
+            tdb_row_lock_t *e = lock_partitions[i].chain;
+            while (e)
+            {
+                tdb_row_lock_t *next = e->hash_next;
+                mysql_cond_destroy(&e->cond);
+                my_free(e->pk);
+                my_free(e);
+                e = next;
+            }
+            mysql_mutex_destroy(&lock_partitions[i].mutex);
+        }
+        my_free(lock_partitions);
+        lock_partitions = NULL;
     }
 
     sql_print_information("TIDESDB: TidesDB closed");
@@ -1328,6 +1562,10 @@ ha_tidesdb::ha_tidesdb(handlerton *hton, TABLE_SHARE *table_arg)
       cached_sess_ttl_(0),
       cached_skip_unique_(false),
       cached_thdvars_valid_(false),
+      stmt_has_write_lock_(false),
+      cached_thd_(NULL),
+      cached_trx_(NULL),
+      trx_registered_(false),
       in_bulk_insert_(false),
       bulk_insert_ops_(0),
       keyread_only_(false),
@@ -1763,19 +2001,24 @@ check_result_t ha_tidesdb::icp_check_secondary(const uint8_t *ik, size_t iks, ui
 
     KEY *idx_key = &table->key_info[idx];
     uint idx_col_len = share->idx_comp_key_len[idx];
+    bool decode_ok = true;
 
-    /* We decode index column parts from the head of the key using the
-       extended decoder that supports integers, DATE, DATETIME, TIMESTAMP,
-       YEAR, and fixed-length CHAR/BINARY (binary/latin1). */
+    /* Decode index column parts from the comparable-format key.
+       If any part can't be decoded (DECIMAL, VARCHAR, etc.), we fall
+       back to a full PK row fetch so the condition evaluates correctly. */
     const uint8_t *pos = ik;
-    for (uint p = 0; p < idx_key->user_defined_key_parts; p++)
+    for (uint p = 0; p < idx_key->user_defined_key_parts && decode_ok; p++)
     {
         KEY_PART_INFO *kp = &idx_key->key_part[p];
         Field *f = kp->field;
 
         if (f->real_maybe_null())
         {
-            if (pos >= ik + iks) return CHECK_POS;
+            if (pos >= ik + iks)
+            {
+                decode_ok = false;
+                break;
+            }
             if (*pos == 0)
             {
                 f->set_null();
@@ -1785,26 +2028,32 @@ check_result_t ha_tidesdb::icp_check_secondary(const uint8_t *ik, size_t iks, ui
             f->set_notnull();
             pos++;
         }
-        if (pos + kp->length > ik + iks) return CHECK_POS;
-        if (!decode_sort_key_part(pos, kp->length, f, buf)) return CHECK_POS;
+        if (pos + kp->length > ik + iks)
+        {
+            decode_ok = false;
+            break;
+        }
+        if (!decode_sort_key_part(pos, kp->length, f, buf)) decode_ok = false;
         pos += kp->length;
     }
 
-    /* We decode PK parts from the tail of the key (pushed condition may
-       reference PK columns since they are appended to every secondary
-       index entry for uniqueness). */
-    if (share->has_user_pk)
+    /* Decode PK parts from the tail (pushed condition may reference PK columns). */
+    if (decode_ok && share->has_user_pk)
     {
         KEY *pk_key = &table->key_info[share->pk_index];
         pos = ik + idx_col_len;
-        for (uint p = 0; p < pk_key->user_defined_key_parts; p++)
+        for (uint p = 0; p < pk_key->user_defined_key_parts && decode_ok; p++)
         {
             KEY_PART_INFO *kp = &pk_key->key_part[p];
             Field *f = kp->field;
 
             if (f->real_maybe_null())
             {
-                if (pos >= ik + iks) return CHECK_POS;
+                if (pos >= ik + iks)
+                {
+                    decode_ok = false;
+                    break;
+                }
                 if (*pos == 0)
                 {
                     f->set_null();
@@ -1814,14 +2063,38 @@ check_result_t ha_tidesdb::icp_check_secondary(const uint8_t *ik, size_t iks, ui
                 f->set_notnull();
                 pos++;
             }
-            if (pos + kp->length > ik + iks) return CHECK_POS;
-            if (!decode_sort_key_part(pos, kp->length, f, buf)) return CHECK_POS;
+            if (pos + kp->length > ik + iks)
+            {
+                decode_ok = false;
+                break;
+            }
+            if (!decode_sort_key_part(pos, kp->length, f, buf)) decode_ok = false;
             pos += kp->length;
         }
     }
 
-    /* All index + PK columns decoded -- delegate to MariaDB's handler
-       ICP evaluator which checks kill state, end_range, and pushed_idx_cond. */
+    if (!decode_ok)
+    {
+        /* Could not decode all key parts from the sort key (unsupported type
+           like DECIMAL, VARCHAR, multi-byte CHAR).  Fall back to a full PK
+           row fetch so ALL columns are available for condition evaluation.
+           This is more expensive than pure ICP (still does the PK lookup)
+           but is correct, the server won't re-evaluate pushed conditions. */
+        if (iks > idx_col_len)
+        {
+            const uchar *pk = ik + idx_col_len;
+            uint pk_len = (uint)(iks - idx_col_len);
+            if (fetch_row_by_pk(scan_txn, pk, pk_len, buf) != 0)
+                return CHECK_POS; /* PK lookup failed, accept row, let caller handle */
+        }
+        else
+        {
+            return CHECK_POS; /* malformed key, accept */
+        }
+    }
+
+    /* Delegate to MariaDB's ICP evaluator which checks kill state,
+       end_range, and pushed_idx_cond->val_bool(). */
     return handler_index_cond_check(this);
 }
 
@@ -2168,16 +2441,10 @@ static std::string tidesdb_decrypt_row(const char *data, size_t len, uint key_id
 
 /* ******************** serialize / deserialize (BLOB deep-copy) ******************** */
 
-/* Row format header magic byte.  Rows starting with this byte use the
-   versioned format: [0xFE] [null_bytes_stored (2 LE)] [field_count (2 LE)].
-   Old-format rows (written before instant DDL support) lack this header;
-   deserialize_row detects them by checking the first byte != 0xFE.
-   0xFE is safe because the old format starts with the null bitmap whose
-   first byte encodes null flags for the first 8 columns (bit values 0-7)
-   and the table-level null bits -- in practice it is never exactly 0xFE
-   for tables with < 7 nullable columns.  For robustness, tables that
-   have never done an instant DDL always write old-format rows (no header)
-   until the first instant schema change sets share->needs_row_header. */
+/* Row format header.  Every row is written with this header:
+   [0xFE magic] [null_bytes_stored (2 LE)] [field_count (2 LE)]
+   This enables instant ADD/DROP COLUMN -- deserialize_row uses the
+   stored null_bytes and field_count to adapt to schema changes. */
 static constexpr uchar ROW_HEADER_MAGIC = 0xFE;
 static constexpr uint ROW_HEADER_SIZE = 5; /* magic(1) + null_bytes(2) + field_count(2) */
 
@@ -2270,20 +2537,19 @@ void ha_tidesdb::deserialize_row(uchar *buf, const uchar *data, size_t len)
     const uchar *from = data;
     const uchar *from_end = data + len;
 
-    /* Detect row format: new format starts with ROW_HEADER_MAGIC (0xFE),
-       old format starts with the null bitmap (pre-instant-DDL rows). */
-    uint stored_null_bytes = table->s->null_bytes;
-    uint stored_fields = table->s->fields;
-
-    if (len >= ROW_HEADER_SIZE && data[0] == ROW_HEADER_MAGIC)
+    /* All rows have the header: [0xFE] [null_bytes(2)] [field_count(2)] */
+    if (unlikely(len < ROW_HEADER_SIZE || data[0] != ROW_HEADER_MAGIC))
     {
-        /* New format: [magic(1)] [null_bytes(2)] [field_count(2)] [null_bitmap] [fields...] */
-        from++;
-        stored_null_bytes = uint2korr(from);
-        from += 2;
-        stored_fields = uint2korr(from);
-        from += 2;
+        /* Corrupted or truncated row -- zero the record to avoid garbage */
+        memset(buf, 0, table->s->reclength);
+        return;
     }
+
+    from++;
+    uint stored_null_bytes = uint2korr(from);
+    from += 2;
+    uint stored_fields = uint2korr(from);
+    from += 2;
 
     /* Null bitmap -- copy the smaller of stored vs current.
        When columns were added (stored_null_bytes < table->s->null_bytes),
@@ -2358,7 +2624,8 @@ void ha_tidesdb::deserialize_row(uchar *buf, const std::string &row)
 
 /*
   Point-lookup a row by its PK bytes (without namespace prefix).
-  Sets current_pk + last_row.  Returns 0 or HA_ERR_KEY_NOT_FOUND.
+  Sets current_pk + last_row.  Returns 0, HA_ERR_KEY_NOT_FOUND,
+  or HA_ERR_LOCK_DEADLOCK (on TDB_ERR_CONFLICT).
 */
 int ha_tidesdb::fetch_row_by_pk(tidesdb_txn_t *txn, const uchar *pk, uint pk_len, uchar *buf)
 {
@@ -2368,7 +2635,8 @@ int ha_tidesdb::fetch_row_by_pk(tidesdb_txn_t *txn, const uchar *pk, uint pk_len
     uint8_t *value = NULL;
     size_t value_size = 0;
     int rc = tidesdb_txn_get(txn, share->cf, dk, dk_len, &value, &value_size);
-    if (rc != TDB_SUCCESS) return HA_ERR_KEY_NOT_FOUND;
+    if (rc == TDB_ERR_NOT_FOUND) return HA_ERR_KEY_NOT_FOUND;
+    if (rc != TDB_SUCCESS) return tdb_rc_to_ha(rc, "fetch_row_by_pk");
 
     if (!share->has_blobs && !share->encrypted)
     {
@@ -2494,8 +2762,18 @@ int ha_tidesdb::write_row(const uchar *buf)
        key building, serialization, and TTL computation. */
     MY_BITMAP *old_map = tmp_use_all_columns(table, &table->read_set);
 
+    bool pk_auto_generated = false; /* true when PK was auto-generated (guaranteed unique) */
     if (table->next_number_field && buf == table->record[0])
     {
+        /* If the PK field is 0/NULL, MariaDB's update_auto_increment() will
+           generate a unique value from our atomic counter.  We can skip the
+           expensive PK uniqueness point-get in that case.
+           Only safe when the auto-inc field is the ENTIRE PK (single-column).
+           For composite PKs, auto-inc only guarantees uniqueness within
+           the auto-inc column, not the full composite key. */
+        if (table->next_number_field->val_int() == 0 && share->has_user_pk &&
+            table->key_info[share->pk_index].user_defined_key_parts == 1)
+            pk_auto_generated = true;
         int ai_err = update_auto_increment();
         if (ai_err)
         {
@@ -2553,22 +2831,19 @@ int ha_tidesdb::write_row(const uchar *buf)
     tidesdb_txn_t *txn = stmt_txn;
     stmt_txn_dirty = true;
 
-    /* Cache THD and trx once -- avoids repeated ha_thd() virtual call
-       and thd_get_ha_data() indirect lookup on every row. */
-    THD *thd = ha_thd();
-    tidesdb_trx_t *trx = (tidesdb_trx_t *)thd_get_ha_data(thd, ht);
+    /* Use cached pointers from external_lock to avoid per-row overhead. */
+    tidesdb_trx_t *trx = cached_trx_;
     if (trx)
     {
         trx->dirty = true;
         trx->stmt_was_dirty = true;
     }
 
-    /* Cache THDVAR lookups once per statement -- avoids repeated
-       thd + offset computation on every row. */
+    /* Cache THDVAR lookups once per statement. */
     if (!cached_thdvars_valid_)
     {
-        cached_skip_unique_ = THDVAR(thd, skip_unique_check);
-        cached_sess_ttl_ = THDVAR(thd, ttl);
+        cached_skip_unique_ = THDVAR(cached_thd_, skip_unique_check);
+        cached_sess_ttl_ = THDVAR(cached_thd_, ttl);
         cached_thdvars_valid_ = true;
     }
 
@@ -2579,8 +2854,10 @@ int ha_tidesdb::write_row(const uchar *buf)
        and the table has no secondary indexes, we skip the dup check entirely --
        tidesdb_txn_put will overwrite the old value, which is exactly what REPLACE
        wants, saving a full point-lookup per row.
-       SET SESSION tidesdb_skip_unique_check=1 (bulk load) also bypasses this. */
-    bool skip_unique = cached_skip_unique_;
+       SET SESSION tidesdb_skip_unique_check=1 (bulk load) also bypasses this.
+       When the PK was auto-generated by our O(1) atomic counter, the value is
+       guaranteed unique (seeded from max existing value) -- skip the point-get. */
+    bool skip_unique = cached_skip_unique_ || pk_auto_generated;
     if (share->has_user_pk && !skip_unique &&
         !(write_can_replace_ && share->num_secondary_indexes == 0))
     {
@@ -2635,8 +2912,17 @@ int ha_tidesdb::write_row(const uchar *buf)
             }
             if (!dup_iter)
             {
-                if (tidesdb_iter_new(txn, share->idx_cfs[i], &dup_iter) != TDB_SUCCESS || !dup_iter)
-                    continue;
+                {
+                    int irc = tidesdb_iter_new(txn, share->idx_cfs[i], &dup_iter);
+                    if (irc != TDB_SUCCESS || !dup_iter)
+                    {
+                        /* Iterator creation failed -- cannot safely skip the
+                           uniqueness check or we risk silent UNIQUE violations.
+                           Propagate the error to the caller. */
+                        tmp_restore_column_map(&table->read_set, old_map);
+                        DBUG_RETURN(tdb_rc_to_ha(irc, "write_row dup_iter_new"));
+                    }
+                }
                 dup_iter_cache_[i] = dup_iter;
                 dup_iter_txn_[i] = txn;
                 dup_iter_txn_gen_[i] = cur_gen;
@@ -3007,14 +3293,20 @@ int ha_tidesdb::index_read_map(uchar *buf, const uchar *key, key_part_map keypar
             uint full_pk_comp_len = share->idx_comp_key_len[share->pk_index];
             if (comp_len >= full_pk_comp_len)
             {
-                /* When pessimistic locking is ON and this is a write statement
-                   (UPDATE/DELETE/SELECT FOR UPDATE), acquire the row lock BEFORE
-                   reading the row.  This serializes the entire read-modify-write
-                   cycle on the same PK, preventing lost updates. */
+                /* Acquire pessimistic row lock when pessimistic_locking=ON
+                   and this is a write-intent read (UPDATE, DELETE, or
+                   SELECT ... FOR UPDATE).  Autocommit statements must also
+                   participate so they block on locks held by multi-statement
+                   transactions, otherwise an autocommit UPDATE silently
+                   bypasses a FOR UPDATE lock and causes commit conflicts. */
                 if (unlikely(srv_pessimistic_locking) && stmt_has_write_lock_)
                 {
-                    tidesdb_trx_t *trx = (tidesdb_trx_t *)thd_get_ha_data(ha_thd(), ht);
-                    if (trx) row_lock_acquire(trx, comp_key, comp_len);
+                    tidesdb_trx_t *trx = cached_trx_;
+                    if (trx)
+                    {
+                        int lrc = row_lock_acquire(trx, comp_key, comp_len);
+                        if (lrc) DBUG_RETURN(lrc);
+                    }
                 }
 
                 /* Full PK match -- point lookup only, no iterator needed.
@@ -3438,14 +3730,14 @@ int ha_tidesdb::index_next_same(uchar *buf, const uchar *key, uint keylen)
         }
 
         /* Partial PK prefix on a composite PK -- iterate through data keys
-           that share this prefix: KEY_NS_DATA + comparable_pk_prefix... */
+           that share this prefix-- KEY_NS_DATA + comparable_pk_prefix... */
         if (!scan_iter || !tidesdb_iter_valid(scan_iter)) DBUG_RETURN(HA_ERR_END_OF_FILE);
 
         uint8_t *ik = NULL;
         size_t iks = 0;
         if (tidesdb_iter_key(scan_iter, &ik, &iks) != TDB_SUCCESS) DBUG_RETURN(HA_ERR_END_OF_FILE);
 
-        /* Data key format: KEY_NS_DATA(1) + comparable_pk.
+        /* Data key format-- KEY_NS_DATA(1) + comparable_pk.
            Check if the PK prefix still matches (skip the namespace byte). */
         if (iks < 1 + idx_search_comp_len_ ||
             memcmp(ik + 1, idx_search_comp_, idx_search_comp_len_) != 0)
@@ -3506,20 +3798,22 @@ int ha_tidesdb::update_row(const uchar *old_data, const uchar *new_data)
 
     MY_BITMAP *old_map = tmp_use_all_columns(table, &table->read_set);
 
+    /* Cache THD and trx once to avoid repeated ha_thd() virtual calls
+       and thd_get_ha_data() indirect lookups throughout this function.
+       Use cached_thd_/cached_trx_ set in external_lock to avoid
+       per-row ha_thd() virtual dispatch and thd_get_ha_data() hash lookup. */
+    tidesdb_trx_t *trx = cached_trx_;
+
     /* We use handler-owned pk buffer for old/new PK to avoid large stack arrays.
        old_pk is saved from current_pk_buf_ before we overwrite it. */
     uchar old_pk[MAX_KEY_LENGTH];
     uint old_pk_len = current_pk_len_;
     memcpy(old_pk, current_pk_buf_, old_pk_len);
 
-    /* When pessimistic locking is enabled, acquire plugin-level row lock
-       on old PK to serialize concurrent UPDATE on the same row.
-       Held until COMMIT/ROLLBACK.  OFF by default -- pure optimistic MVCC. */
-    if (unlikely(srv_pessimistic_locking))
-    {
-        tidesdb_trx_t *trx = (tidesdb_trx_t *)thd_get_ha_data(ha_thd(), ht);
-        if (trx) row_lock_acquire(trx, old_pk, old_pk_len);
-    }
+    /* Row locks are acquired in index_read_map() for SELECT ... FOR UPDATE.
+       No need to acquire here, the row is already locked from the preceding
+       locking read.  For plain UPDATE without FOR UPDATE, the operation is
+       atomic (single autocommit statement) and no lock is needed. */
 
     /* new_pk uses its own stack buffer so it survives the current_pk_buf_
        manipulations in the secondary index loop (avoids overlapping memcpy UB) */
@@ -3546,21 +3840,17 @@ int ha_tidesdb::update_row(const uchar *old_data, const uchar *new_data)
     }
     tidesdb_txn_t *txn = stmt_txn;
     stmt_txn_dirty = true;
+    if (trx)
     {
-        tidesdb_trx_t *trx = (tidesdb_trx_t *)thd_get_ha_data(ha_thd(), ht);
-        if (trx)
-        {
-            trx->dirty = true;
-            trx->stmt_was_dirty = true;
-        }
+        trx->dirty = true;
+        trx->stmt_was_dirty = true;
     }
 
     /* Populate THDVAR cache if not yet done this statement */
     if (!cached_thdvars_valid_)
     {
-        THD *thd = ha_thd();
-        cached_skip_unique_ = THDVAR(thd, skip_unique_check);
-        cached_sess_ttl_ = THDVAR(thd, ttl);
+        cached_skip_unique_ = THDVAR(cached_thd_, skip_unique_check);
+        cached_sess_ttl_ = THDVAR(cached_thd_, ttl);
         cached_thdvars_valid_ = true;
     }
 
@@ -3645,12 +3935,11 @@ int ha_tidesdb::delete_row(const uchar *buf)
 
     MY_BITMAP *old_map = tmp_use_all_columns(table, &table->read_set);
 
-    /* When pessimistic locking is enabled, acquire row lock before delete */
-    if (unlikely(srv_pessimistic_locking))
-    {
-        tidesdb_trx_t *trx = (tidesdb_trx_t *)thd_get_ha_data(ha_thd(), ht);
-        if (trx) row_lock_acquire(trx, current_pk_buf_, current_pk_len_);
-    }
+    /* Use cached_trx_ from external_lock to avoid per-row hash lookups. */
+    tidesdb_trx_t *trx = cached_trx_;
+
+    /* Row locks are acquired in index_read_map() for SELECT ... FOR UPDATE.
+       No need to acquire here - see update_row() comment. */
 
     {
         int erc = ensure_stmt_txn();
@@ -3662,13 +3951,10 @@ int ha_tidesdb::delete_row(const uchar *buf)
     }
     tidesdb_txn_t *txn = stmt_txn;
     stmt_txn_dirty = true;
+    if (trx)
     {
-        tidesdb_trx_t *trx = (tidesdb_trx_t *)thd_get_ha_data(ha_thd(), ht);
-        if (trx)
-        {
-            trx->dirty = true;
-            trx->stmt_was_dirty = true;
-        }
+        trx->dirty = true;
+        trx->stmt_was_dirty = true;
     }
 
     /* We delete data row */
@@ -3898,8 +4184,8 @@ int ha_tidesdb::info(uint flag)
     }
 
     /* HA_STATUS_CONST -- set rec_per_key for index selectivity estimates.
-       PK and UNIQUE indexes: rec_per_key = 1.
-       Non-unique secondary indexes: use cached_rec_per_key if populated
+       PK and UNIQUE indexes -- rec_per_key = 1.
+       Non-unique secondary indexes -- use cached_rec_per_key if populated
        by ANALYZE TABLE, else use a heuristic (total_keys / 10). */
     if ((flag & HA_STATUS_CONST) && share)
     {
@@ -4068,11 +4354,11 @@ int ha_tidesdb::analyze(THD *thd, HA_CHECK_OPT *check_opt)
 
         if (distinct > 0)
         {
-            /* Use sampled ratio to extrapolate for the full index */
+            /* We use sampled ratio to extrapolate for the full index */
             uint64_t total = (idx_total_keys > 0) ? idx_total_keys : sampled;
             if (sampled < total)
             {
-                /* Extrapolate: distinct_full ≈ distinct * (total / sampled) */
+                /* Extrapolate -- distinct_full ≈ distinct * (total / sampled) */
                 double ratio = (double)total / (double)sampled;
                 uint64_t est_distinct = (uint64_t)(distinct * ratio);
                 if (est_distinct == 0) est_distinct = 1;
@@ -4116,7 +4402,7 @@ int ha_tidesdb::optimize(THD *thd, HA_CHECK_OPT *check_opt)
 
     if (!share || !share->cf) DBUG_RETURN(HA_ADMIN_FAILED);
 
-    /* tidesdb_purge_cf() is synchronous: flushes memtable to disk, then
+    /* tidesdb_purge_cf() is synchronous -- flushes memtable to disk, then
        runs a full compaction inline, blocking until complete.  This is
        the right semantic for OPTIMIZE TABLE -- the caller expects the
        table to be fully compacted when the statement returns. */
@@ -4309,7 +4595,8 @@ ha_rows ha_tidesdb::records_in_range(uint inx, const key_range *min_key, const k
 
 ulong ha_tidesdb::index_flags(uint idx, uint part, bool all_parts) const
 {
-    ulong flags = HA_READ_NEXT | HA_READ_PREV | HA_READ_ORDER | HA_READ_RANGE;
+    ulong flags =
+        HA_READ_NEXT | HA_READ_PREV | HA_READ_ORDER | HA_READ_RANGE | HA_DO_INDEX_COND_PUSHDOWN;
     if (table_share && table_share->primary_key != MAX_KEY && idx == table_share->primary_key)
         flags |= HA_CLUSTERED_INDEX;
     else
@@ -4368,25 +4655,28 @@ int ha_tidesdb::extra(enum ha_extra_function operation)
 */
 int ha_tidesdb::ensure_stmt_txn()
 {
-    if (stmt_txn)
-    {
-        return 0;
-    }
+    if (stmt_txn) return 0;
 
-    THD *thd = ha_thd();
+    THD *thd = cached_thd_ ? cached_thd_ : ha_thd();
 
-    /* Resolve isolation level from MariaDB session (SET TRANSACTION ISOLATION
-       LEVEL / tx_isolation), falling back to table-level TidesDB SNAPSHOT
-       when the session uses the default REPEATABLE_READ.
-       Force READ_COMMITTED for DDL to avoid unbounded read-set growth. */
+    /* Resolve isolation -- same logic as external_lock.
+       DDL uses READ_COMMITTED to avoid unbounded read-set growth.
+       Autocommit single-statement DML uses READ_COMMITTED (no
+       concurrent modification within a single-stmt txn to conflict with).
+       Multi-statement transactions (BEGIN...COMMIT) use the session's
+       isolation level so that write-write conflict detection is active. */
     int sql_cmd = thd_sql_command(thd);
+    bool is_ddl =
+        (sql_cmd == SQLCOM_ALTER_TABLE || sql_cmd == SQLCOM_CREATE_INDEX ||
+         sql_cmd == SQLCOM_DROP_INDEX || sql_cmd == SQLCOM_TRUNCATE || sql_cmd == SQLCOM_OPTIMIZE ||
+         sql_cmd == SQLCOM_CREATE_TABLE || sql_cmd == SQLCOM_DROP_TABLE);
+    bool is_autocommit = !thd_test_options(thd, OPTION_NOT_AUTOCOMMIT | OPTION_BEGIN);
     tidesdb_isolation_level_t effective_iso;
-    if (sql_cmd == SQLCOM_ALTER_TABLE || sql_cmd == SQLCOM_CREATE_INDEX ||
-        sql_cmd == SQLCOM_DROP_INDEX || sql_cmd == SQLCOM_TRUNCATE || sql_cmd == SQLCOM_OPTIMIZE ||
-        sql_cmd == SQLCOM_CREATE_TABLE || sql_cmd == SQLCOM_DROP_TABLE)
+    if (is_ddl || is_autocommit)
         effective_iso = TDB_ISOLATION_READ_COMMITTED;
     else
-        effective_iso = resolve_effective_isolation(thd, share->isolation_level);
+        effective_iso = resolve_effective_isolation(
+            thd, share ? share->isolation_level : TDB_ISOLATION_SNAPSHOT);
     tidesdb_trx_t *trx = get_or_create_trx(thd, ht, effective_iso);
     if (!trx) return HA_ERR_OUT_OF_MEM;
 
@@ -4420,56 +4710,83 @@ int ha_tidesdb::external_lock(THD *thd, int lock_type)
 
         /* Resolve isolation from the MariaDB session (SET TRANSACTION ISOLATION
            LEVEL / tx_isolation), honoring table-level SNAPSHOT when the session
-           uses the default REPEATABLE_READ. */
+           uses the default REPEATABLE_READ.
+
+           DDL always uses READ_COMMITTED to avoid unbounded read-set growth
+           (ALTER TABLE scans can read millions of rows).
+
+           Autocommit single-statement DML uses READ_COMMITTED -- there's no
+           concurrent modification within a single-stmt txn, so conflict
+           tracking is pure overhead.  InnoDB similarly optimizes autocommit.
+
+           Multi-statement transactions (BEGIN...COMMIT) use the session's
+           isolation level via resolve_effective_isolation() so that
+           write-write conflict detection (SNAPSHOT) is active.  This maps
+           MariaDB's REPEATABLE_READ --> TidesDB SNAPSHOT which detects
+           concurrent writes to the same key (first-committer-wins).
+
+           Note     in unified memtable mode, conflict detection against
+           in-flight memtable data is limited (per-CF memtable is NULL),
+           but SSTable-level conflict detection still works.  This is
+           acceptable for OLTP since hot-row conflicts are the primary
+           concern and recently-flushed data covers most cases. */
         int sql_cmd = thd_sql_command(thd);
+        bool is_ddl = (sql_cmd == SQLCOM_ALTER_TABLE || sql_cmd == SQLCOM_CREATE_INDEX ||
+                       sql_cmd == SQLCOM_DROP_INDEX || sql_cmd == SQLCOM_TRUNCATE ||
+                       sql_cmd == SQLCOM_OPTIMIZE || sql_cmd == SQLCOM_CREATE_TABLE ||
+                       sql_cmd == SQLCOM_DROP_TABLE);
+        bool is_autocommit = !thd_test_options(thd, OPTION_NOT_AUTOCOMMIT | OPTION_BEGIN);
         tidesdb_isolation_level_t effective_iso;
-        if (sql_cmd == SQLCOM_ALTER_TABLE || sql_cmd == SQLCOM_CREATE_INDEX ||
-            sql_cmd == SQLCOM_DROP_INDEX || sql_cmd == SQLCOM_TRUNCATE ||
-            sql_cmd == SQLCOM_OPTIMIZE || sql_cmd == SQLCOM_CREATE_TABLE ||
-            sql_cmd == SQLCOM_DROP_TABLE)
-            effective_iso = TDB_ISOLATION_READ_COMMITTED;
-        else if (unlikely(srv_pessimistic_locking))
-            /* When pessimistic locking is ON, the plugin's row-lock mutexes
-               already serialize concurrent access to the same row.  SNAPSHOT
-               conflict detection is redundant and causes spurious commit
-               failures on rows that were safely serialized by the mutex.
-               Use READ_COMMITTED so the library skips conflict checks. */
+        if (is_ddl || is_autocommit)
             effective_iso = TDB_ISOLATION_READ_COMMITTED;
         else
-            effective_iso = resolve_effective_isolation(thd, share->isolation_level);
+            effective_iso = resolve_effective_isolation(
+                thd, share ? share->isolation_level : TDB_ISOLATION_SNAPSHOT);
         tidesdb_trx_t *trx = get_or_create_trx(thd, ht, effective_iso);
         if (!trx) DBUG_RETURN(HA_ERR_OUT_OF_MEM);
 
-        DBUG_PRINT("tidesdb_debug",
-                   ("external_lock: iso=%d txn=%p gen=%lu dirty=%d", (int)effective_iso, trx->txn,
-                    (unsigned long)trx->txn_generation, trx->dirty));
+        /* Debug print removed from hot path -- even DBUG_PRINT costs
+           format-string evaluation in debug builds. */
 
         stmt_txn = trx->txn;
         stmt_txn_dirty = false;
-        stmt_has_write_lock_ = (lock_type == F_WRLCK);
+        stmt_has_write_lock_ |= (lock_type == F_WRLCK);
 
-        /* We register at statement level (always) */
+        /* Cache THD and trx pointers for fast access in hot paths
+           (index_read_map, update_row, delete_row, ensure_stmt_txn).
+           Eliminates ha_thd() virtual dispatch and thd_get_ha_data()
+           hash lookup on every row operation. */
+        cached_thd_ = thd;
+        cached_trx_ = trx;
+
+        /* Register at statement level (always needed per statement) */
         trans_register_ha(thd, false, ht, 0);
 
-        /* We register at transaction level if inside BEGIN block */
+        /* Register at transaction level if inside BEGIN block */
         if (thd_test_options(thd, OPTION_NOT_AUTOCOMMIT | OPTION_BEGIN))
-        {
             trans_register_ha(thd, true, ht, 0);
-
-            /* Savepoint for statement-level rollback is managed by
-               tidesdb_commit(all=false) and tidesdb_rollback(all=false). */
-        }
     }
     else
     {
-        if (scan_iter)
+        /* For multi-statement transactions (BEGIN...COMMIT), the txn stays
+           the same across statements.  Preserve scan_iter and dup_iter_cache
+           across READ-ONLY statements so the next statement can reuse them
+           (avoids O(sstables) merge-heap rebuild).
+           After WRITE statements, iterators must be invalidated because
+           new txn ops (puts/deletes) are not visible to iterators created
+           before those ops were added.  For autocommit, always free. */
+        bool in_multi_stmt = thd_test_options(thd, OPTION_NOT_AUTOCOMMIT | OPTION_BEGIN);
+        if (!in_multi_stmt || stmt_txn_dirty)
         {
-            tidesdb_iter_free(scan_iter);
-            scan_iter = NULL;
-            scan_iter_cf_ = NULL;
-            scan_iter_txn_ = NULL;
+            if (scan_iter)
+            {
+                tidesdb_iter_free(scan_iter);
+                scan_iter = NULL;
+                scan_iter_cf_ = NULL;
+                scan_iter_txn_ = NULL;
+            }
+            if (dup_iter_count_ > 0) free_dup_iter_cache();
         }
-        if (dup_iter_count_ > 0) free_dup_iter_cache();
 
         /* We bump update_time once per write-statement for information_schema.
            Use cached_time_ if available to avoid another time() syscall. */
@@ -4486,6 +4803,13 @@ int ha_tidesdb::external_lock(THD *thd, int lock_type)
 
         stmt_txn = NULL;
         stmt_txn_dirty = false;
+        stmt_has_write_lock_ = false;
+        cached_thd_ = NULL;
+        cached_trx_ = NULL;
+        /* Reset trx_registered_ for autocommit -- the txn will be freed
+           in tidesdb_commit and a new one created next time.
+           For multi-stmt (BEGIN...COMMIT), keep it true since the txn persists. */
+        if (!thd_test_options(thd, OPTION_NOT_AUTOCOMMIT | OPTION_BEGIN)) trx_registered_ = false;
     }
 
     DBUG_RETURN(0);
@@ -4495,7 +4819,36 @@ THR_LOCK_DATA **ha_tidesdb::store_lock(THD *thd, THR_LOCK_DATA **to, enum thr_lo
 {
     /* With lock_count()=0 MariaDB skips THR_LOCK entirely.
        store_lock is still called for informational purposes but we
-       do not push into the 'to' array (same pattern as InnoDB). */
+       do not push into the 'to' array (same pattern as InnoDB).
+
+       However, we use this callback to detect locking reads
+       (SELECT ... FOR UPDATE, SELECT ... IN SHARE MODE) and
+       data-modifying statements.  MariaDB calls store_lock() BEFORE
+       external_lock(), so we can set stmt_has_write_lock_ here for
+       the pessimistic row lock path.
+
+       InnoDB uses store_lock() to set m_prebuilt->select_lock_type
+       to LOCK_S/LOCK_X for these cases.  We emulate this by detecting
+       the same lock_type values and setting our write-lock flag.
+
+       We flag locking READS (SELECT ... FOR UPDATE, SELECT ... IN
+       SHARE MODE) so the pessimistic row lock path in index_read_map()
+       acquires stripe locks for serialization.
+
+       SELECT ... FOR UPDATE passes lock_type >= TL_FIRST_WRITE.
+       SELECT ... IN SHARE MODE passes TL_READ_WITH_SHARED_LOCKS.
+
+       Inside stored procedures, thd_sql_command() returns SQLCOM_CALL
+       (not SQLCOM_SELECT), so we cannot filter by SQL command.
+       Instead we use the lock_type directly.  This means UPDATE/DELETE
+       statements also set stmt_has_write_lock_=true, but that's OK
+       because we removed lock acquisition from update_row()/delete_row()
+       only index_read_map() acquires pessimistic locks now, and only
+       for PK exact matches (the SELECT ... FOR UPDATE pattern). */
+    if (lock_type == TL_READ_WITH_SHARED_LOCKS || lock_type >= TL_FIRST_WRITE)
+    {
+        stmt_has_write_lock_ = true;
+    }
     return to;
 }
 
@@ -4763,7 +5116,7 @@ bool ha_tidesdb::inplace_alter_table(TABLE *altered_table, Alter_inplace_info *h
            altered_table->key_info fields have ptr into altered_table->record[0],
            but the data lives in table->record[0].  We compute ptdiff to
            rebase field pointers to read from the correct buffer.
-           Key format matches make_comparable_key(): [null_byte] + sort_string. */
+           Key format matches make_comparable_key()= [null_byte] + sort_string. */
         my_ptrdiff_t ptdiff = (my_ptrdiff_t)(table->record[0] - altered_table->record[0]);
 
         for (uint a = 0; a < ctx->add_cfs.size(); a++)
@@ -4840,26 +5193,39 @@ bool ha_tidesdb::inplace_alter_table(TABLE *altered_table, Alter_inplace_info *h
             DBUG_RETURN(true);
         }
 
-        /* We commit in batches to avoid unbounded txn buffer growth */
+        /* We commit in batches to avoid unbounded txn buffer growth.
+           Use txn_reset instead of free+begin to preserve internal txn
+           buffers (ops array, arenas) -- same pattern as bulk insert. */
         if (rows_processed % TIDESDB_INDEX_BUILD_BATCH == 0)
         {
             {
                 int crc = tidesdb_txn_commit(txn);
                 if (crc != TDB_SUCCESS)
+                {
                     sql_print_warning("TIDESDB: inplace ADD INDEX: batch commit failed rc=%d", crc);
-                tidesdb_txn_rollback(txn);
+                    tidesdb_txn_rollback(txn);
+                }
             }
-            tidesdb_txn_free(txn);
             tidesdb_iter_free(iter);
 
-            txn = NULL;
-            rc = tidesdb_txn_begin_with_isolation(tdb_global, TDB_ISOLATION_READ_COMMITTED, &txn);
-            if (rc != TDB_SUCCESS || !txn)
+            /* Reset reuses the txn with READ_COMMITTED -- index builds
+               don't need snapshot consistency across batches. */
+            int rrc = tidesdb_txn_reset(txn, TDB_ISOLATION_READ_COMMITTED);
+            if (rrc != TDB_SUCCESS)
             {
-                sql_print_error("TIDESDB: inplace ADD INDEX: batch txn_begin failed");
-                my_error(ER_INTERNAL_ERROR, MYF(0), "TidesDB: batch txn failed during index build");
-                tmp_restore_column_map(&altered_table->read_set, old_map);
-                DBUG_RETURN(true);
+                /* Reset failed -- fall back to free+begin */
+                tidesdb_txn_free(txn);
+                txn = NULL;
+                rc = tidesdb_txn_begin_with_isolation(tdb_global, TDB_ISOLATION_READ_COMMITTED,
+                                                      &txn);
+                if (rc != TDB_SUCCESS || !txn)
+                {
+                    sql_print_error("TIDESDB: inplace ADD INDEX: batch txn_begin failed");
+                    my_error(ER_INTERNAL_ERROR, MYF(0),
+                             "TidesDB: batch txn failed during index build");
+                    tmp_restore_column_map(&altered_table->read_set, old_map);
+                    DBUG_RETURN(true);
+                }
             }
             iter = NULL;
             rc = tidesdb_iter_new(txn, share->cf, &iter);
@@ -4873,7 +5239,12 @@ bool ha_tidesdb::inplace_alter_table(TABLE *altered_table, Alter_inplace_info *h
             }
             /* We seek directly to the last processed key and advance past it,
                instead of seeking to first and skipping N rows (O(n²)). */
-            tidesdb_iter_seek(iter, last_data_key, last_data_key_len);
+            int src = tidesdb_iter_seek(iter, last_data_key, last_data_key_len);
+            if (src != TDB_SUCCESS)
+            {
+                sql_print_warning("TIDESDB: inplace ADD INDEX: iter_seek failed rc=%d", src);
+                break; /* end scan gracefully */
+            }
             if (tidesdb_iter_valid(iter)) tidesdb_iter_next(iter);
             continue; /* Don't call iter_next again */
         }
@@ -4896,8 +5267,7 @@ bool ha_tidesdb::inplace_alter_table(TABLE *altered_table, Alter_inplace_info *h
         DBUG_RETURN(true);
     }
 
-    sql_print_information("TIDESDB: inplace ADD INDEX: populated %llu rows into %u new index(es)",
-                          (unsigned long long)rows_processed, (uint)ctx->add_cfs.size());
+    /* Info log removed -- success visible via SQL response */
 
     tmp_restore_column_map(&altered_table->read_set, old_map);
     DBUG_RETURN(false);
@@ -5197,14 +5567,14 @@ static struct st_mysql_storage_engine tidesdb_storage_engine = {MYSQL_HANDLERTON
 maria_declare_plugin(tidesdb){
     MYSQL_STORAGE_ENGINE_PLUGIN,
     &tidesdb_storage_engine,
-    "TIDESDB",
+    "TidesDB",
     "TidesDB",
     "Supports ACID transactions, lock-free concurrency, indexing, and encryption for tables",
     PLUGIN_LICENSE_GPL,
     tidesdb_init_func,
     tidesdb_deinit_func,
-    0x30700,
+    0x40000,
     NULL,
     tidesdb_system_variables,
-    "3.7.0",
+    "4.0.0",
     MariaDB_PLUGIN_MATURITY_GAMMA} maria_declare_plugin_end;

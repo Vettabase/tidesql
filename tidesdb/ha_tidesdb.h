@@ -17,6 +17,7 @@
 #pragma once
 
 #include <atomic>
+#include <condition_variable>
 #include <mutex>
 #include <string>
 #include <unordered_set>
@@ -175,18 +176,24 @@ class ha_tidesdb_inplace_ctx : public inplace_alter_handler_ctx
 struct tidesdb_trx_t
 {
     tidesdb_txn_t *txn;
-    bool dirty;                                /* true once any DML uses txn */
-    bool stmt_savepoint_active;                /* true while a "stmt" savepoint exists */
-    bool stmt_was_dirty;                       /* true if current stmt had writes */
+    bool dirty;                 /* true once any DML uses txn */
+    bool stmt_savepoint_active; /* true while a "stmt" savepoint exists */
+    bool stmt_was_dirty;        /* true if current stmt had writes */
+    bool needs_reset;           /* true after commit/rollback; cleared after txn_reset */
     tidesdb_isolation_level_t isolation_level; /* from first table opened */
     uint64_t txn_generation; /* monotonic counter; incremented each time a new txn is created */
 
-    /* Plugin-level row locks -- striped mutex indices held by this txn.
-       Acquired during SELECT FOR UPDATE / UPDATE / DELETE on hot rows,
-       released on commit/rollback.  This emulates pessimistic row locking
-       for workloads like TPC-C that require read-modify-write serialization
-       on the same key (TidesDB library uses optimistic MVCC only). */
-    std::unordered_set<uint32_t> *held_row_locks; /* heap-allocated, NULL until first lock */
+    /* Plugin-level row locks -- lock table entries held by this txn.
+       Acquired during SELECT FOR UPDATE (index_read_map with write intent)
+       and UPDATE/DELETE (update_row/delete_row).  Released on commit/rollback.
+       Implements pessimistic row locking with deadlock detection via a global
+       lock table (hash table with wait queues and wait-for graph traversal).
+       This emulates InnoDB-style row locks for workloads like TPC-C that
+       require read-modify-write serialization on the same key. */
+    struct tdb_row_lock_t *held_locks_head; /* singly-linked list of held lock entries */
+    uint64_t lock_txn_id; /* unique ID for deadlock detection (= txn_generation) */
+    struct tdb_row_lock_t
+        *waiting_on; /* lock entry we're currently blocked on (NULL if not waiting) */
 };
 
 /*
@@ -266,9 +273,16 @@ class ha_tidesdb : public handler
     bool cached_skip_unique_;
     bool cached_thdvars_valid_;
 
-    /* Write-lock mode -- set when external_lock(F_WRLCK) is called.
+    /* Write-lock mode -- set when store_lock detects FOR UPDATE / write intent.
        Used to decide whether to acquire row locks in index_read_map. */
     bool stmt_has_write_lock_;
+
+    /* Cached per-statement pointers to avoid repeated hash lookups.
+       Set in external_lock(lock), cleared in external_lock(F_UNLCK).
+       InnoDB caches these as m_user_thd / m_prebuilt->trx. */
+    THD *cached_thd_;           /* avoids ha_thd() virtual dispatch */
+    tidesdb_trx_t *cached_trx_; /* avoids thd_get_ha_data() hash lookup */
+    bool trx_registered_;       /* true once trans_register_ha() called this txn */
 
     /* Bulk insert state */
     bool in_bulk_insert_;
