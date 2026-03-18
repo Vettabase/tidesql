@@ -257,24 +257,30 @@ Read-only (set at startup):
   data_home_dir             Override TidesDB data directory (default: auto)
   log_to_file               Write logs to file vs stderr (default: ON)
   log_truncation_at         Log file truncation size (default: 24MB; 0 = off)
-  row_lock_stripes          Striped mutexes for pessimistic locking (default: 1024)
+  unified_memtable          Single shared WAL+memtable across all CFs (default: ON)
+  unified_memtable_write_buffer_size  Write buffer for unified memtable (default: 128MB)
+  unified_memtable_sync_mode         NONE/INTERVAL/FULL for unified WAL (default: FULL)
+  unified_memtable_sync_interval     Sync interval in µs for INTERVAL mode (default: 128000)
+  row_lock_stripes          Legacy compat; lock table uses 256 hash partitions
 
 Dynamic (SET GLOBAL at runtime):
 
   backup_dir                Set to a path to trigger online backup
   checkpoint_dir            Set to a path to trigger hard-link checkpoint
   print_all_conflicts       Log all TDB_ERR_CONFLICT events (default: OFF)
-  pessimistic_locking       Enable plugin-level row locks for UPDATE/DELETE
-                            (default: OFF). Serializes concurrent writes to
-                            the same PK like InnoDB's row locks. Enable for
-                            TPC-C or workloads needing FOR UPDATE semantics.
+  pessimistic_locking       Enable plugin-level row locks for SELECT...FOR UPDATE
+                            in multi-statement transactions (default: OFF).
+                            Uses a partitioned hash-table lock manager with
+                            per-row granularity and wait-for-graph deadlock
+                            detection. Enable for TPC-C or workloads needing
+                            FOR UPDATE serialization semantics.
 
 Session (SET SESSION tidesdb_...):
 
   ttl                       Per-session TTL override in seconds (default: 0)
   skip_unique_check         Skip PK/unique checks on INSERT (default: OFF)
   default_compression       Default compression for new tables
-  default_write_buffer_size Default write buffer for new tables (32MB)
+  default_write_buffer_size Default write buffer for new tables (128MB)
   default_sync_mode         Default sync mode for new tables (FULL)
   (and other default_* variables for all table options)
 
@@ -291,9 +297,9 @@ family configuration.  ALTER TABLE ... <option>=<value> updates both the .frm
 and the live column family via tidesdb_cf_update_runtime_config().
 
 Storage:
-  WRITE_BUFFER_SIZE         Memtable size before flush (default: 32MB)
+  WRITE_BUFFER_SIZE         Memtable size before flush (default: 128MB)
   MIN_DISK_SPACE            Minimum free disk space (default: 100MB)
-  KLOG_VALUE_THRESHOLD      Values larger than this go to vlog (default: 4096)
+  KLOG_VALUE_THRESHOLD      Values larger than this go to vlog (default: 512)
 
 Compression:
   COMPRESSION               NONE/SNAPPY/LZ4/ZSTD/LZ4_FAST (default: LZ4)
@@ -316,7 +322,7 @@ LSM Tree:
   MIN_LEVELS                Minimum LSM levels (default: 5)
   DIVIDING_LEVEL_OFFSET     Compaction dividing level offset (default: 2)
   L1_FILE_COUNT_TRIGGER     L1 file count trigger for compaction (default: 4)
-  L0_QUEUE_STALL_THRESHOLD  L0 queue stall threshold (default: 8)
+  L0_QUEUE_STALL_THRESHOLD  L0 queue stall threshold (default: 20)
 
 Skip List:
   SKIP_LIST_MAX_LEVEL       Max skip list level (default: 12)
