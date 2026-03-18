@@ -2079,17 +2079,17 @@ check_result_t ha_tidesdb::icp_check_secondary(const uint8_t *ik, size_t iks, ui
            like DECIMAL, VARCHAR, multi-byte CHAR).  Fall back to a full PK
            row fetch so ALL columns are available for condition evaluation.
            This is more expensive than pure ICP (still does the PK lookup)
-           but is correct — the server won't re-evaluate pushed conditions. */
+           but is correct, the server won't re-evaluate pushed conditions. */
         if (iks > idx_col_len)
         {
             const uchar *pk = ik + idx_col_len;
             uint pk_len = (uint)(iks - idx_col_len);
             if (fetch_row_by_pk(scan_txn, pk, pk_len, buf) != 0)
-                return CHECK_POS; /* PK lookup failed — accept row, let caller handle */
+                return CHECK_POS; /* PK lookup failed, accept row, let caller handle */
         }
         else
         {
-            return CHECK_POS; /* malformed key — accept */
+            return CHECK_POS; /* malformed key, accept */
         }
     }
 
@@ -3293,14 +3293,13 @@ int ha_tidesdb::index_read_map(uchar *buf, const uchar *key, key_part_map keypar
             uint full_pk_comp_len = share->idx_comp_key_len[share->pk_index];
             if (comp_len >= full_pk_comp_len)
             {
-                /* Acquire pessimistic row lock only for multi-statement
-                   transactions (BEGIN...COMMIT) where SELECT ... FOR UPDATE
-                   needs to serialize the read-modify-write cycle.
-                   Skip for autocommit — each statement is atomic and row
-                   locks add ~20µs overhead per operation that destroys
-                   throughput at high concurrency (2K vs 50K TPS). */
-                if (unlikely(srv_pessimistic_locking) && stmt_has_write_lock_ && cached_thd_ &&
-                    thd_test_options(cached_thd_, OPTION_NOT_AUTOCOMMIT | OPTION_BEGIN))
+                /* Acquire pessimistic row lock when pessimistic_locking=ON
+                   and this is a write-intent read (UPDATE, DELETE, or
+                   SELECT ... FOR UPDATE).  Autocommit statements must also
+                   participate so they block on locks held by multi-statement
+                   transactions, otherwise an autocommit UPDATE silently
+                   bypasses a FOR UPDATE lock and causes commit conflicts. */
+                if (unlikely(srv_pessimistic_locking) && stmt_has_write_lock_)
                 {
                     tidesdb_trx_t *trx = cached_trx_;
                     if (trx)
@@ -3812,7 +3811,7 @@ int ha_tidesdb::update_row(const uchar *old_data, const uchar *new_data)
     memcpy(old_pk, current_pk_buf_, old_pk_len);
 
     /* Row locks are acquired in index_read_map() for SELECT ... FOR UPDATE.
-       No need to acquire here — the row is already locked from the preceding
+       No need to acquire here, the row is already locked from the preceding
        locking read.  For plain UPDATE without FOR UPDATE, the operation is
        atomic (single autocommit statement) and no lock is needed. */
 
@@ -3940,7 +3939,7 @@ int ha_tidesdb::delete_row(const uchar *buf)
     tidesdb_trx_t *trx = cached_trx_;
 
     /* Row locks are acquired in index_read_map() for SELECT ... FOR UPDATE.
-       No need to acquire here — see update_row() comment. */
+       No need to acquire here - see update_row() comment. */
 
     {
         int erc = ensure_stmt_txn();
@@ -4844,7 +4843,7 @@ THR_LOCK_DATA **ha_tidesdb::store_lock(THD *thd, THR_LOCK_DATA **to, enum thr_lo
        Instead we use the lock_type directly.  This means UPDATE/DELETE
        statements also set stmt_has_write_lock_=true, but that's OK
        because we removed lock acquisition from update_row()/delete_row()
-       — only index_read_map() acquires pessimistic locks now, and only
+       only index_read_map() acquires pessimistic locks now, and only
        for PK exact matches (the SELECT ... FOR UPDATE pattern). */
     if (lock_type == TL_READ_WITH_SHARED_LOCKS || lock_type >= TL_FIRST_WRITE)
     {
