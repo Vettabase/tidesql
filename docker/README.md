@@ -17,6 +17,8 @@ storage engine) in a container.
 docker/
 ├── conf/
 │   └── my.cnf
+|   └── inc/
+|       └── tidesdb.cnf
 ├── ubuntu/
 │   ├── utils/
 │   │   └── cmake_exclude_engines.sh
@@ -200,7 +202,7 @@ We configured MariaDB to use a clean directory tree:
 
 ```
 /usr/local/mariadb
-├── data
+ data
 │   └── default        (regular storage engines write here)
 |   └── tidesdb-data   (TidesDB data files and LOG)
 └── log
@@ -209,6 +211,10 @@ We configured MariaDB to use a clean directory tree:
     ├── slow.log
     ├── general.log
     └── sqlerr.log     (SQL Error Log)
+/etc/mysql
+├──inc
+|   └── tidesdb.cnf
+└── my.cnf
 ```
 
 
