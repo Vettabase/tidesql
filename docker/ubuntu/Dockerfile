@@ -89,10 +89,8 @@ RUN export TIDESDB_ROOT="${TIDESDB_PREFIX}" && \
 
 # ── 6. Create mysql system user and prepare runtime directories ─────────────
 RUN useradd -r -s /bin/false -d "${MARIADB_PREFIX}/data" mysql && \
-    mkdir -p "${MARIADB_PREFIX}/data/default" \
-             "${MARIADB_PREFIX}/log" && \
-    chown -R mysql:mysql "${MARIADB_PREFIX}/data" \
-                         "${MARIADB_PREFIX}/log"
+    mkdir -p "${MARIADB_PREFIX}/data/default" && \
+    chown -R mysql:mysql "${MARIADB_PREFIX}/data"
 
 # bind-address is set to 0.0.0.0 so the port is reachable from the Docker host.
 COPY docker/conf/ /etc/mysql/
@@ -104,7 +102,6 @@ RUN chmod +x /usr/local/bin/tidesql-entrypoint.sh
 
 VOLUME /etc/mysql
 VOLUME /usr/local/mariadb/data
-VOLUME /usr/local/mariadb/log
 
 EXPOSE 3306
 
