@@ -13,7 +13,7 @@
 case "${1:-}" in
     -h|--help)
         cat <<'EOF'
-cmake_exclude_engines.sh — convert a comma-separated list of storage engine
+cmake_exclude_engines.sh - convert a comma-separated list of storage engine
 names into cmake -DPLUGIN_xxx=NO flags.
 
 Usage:

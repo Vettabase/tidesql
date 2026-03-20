@@ -1,6 +1,6 @@
 #
 # ============================================
-# TEST 1: READ COMMITTED — sees committed data
+# TEST 1: READ COMMITTED - sees committed data
 # ============================================
 #
 CREATE TABLE t_iso (
@@ -28,7 +28,7 @@ disconnect con1;
 connection default;
 #
 # ============================================
-# TEST 2: REPEATABLE READ — snapshot isolation
+# TEST 2: REPEATABLE READ - snapshot isolation
 # ============================================
 #
 connect  con2, localhost, root,,;

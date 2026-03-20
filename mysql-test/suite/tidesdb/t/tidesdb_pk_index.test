@@ -7,7 +7,7 @@ DROP TABLE IF EXISTS t_pk, t_autoinc, t_secidx, t_combined;
 
 --echo #
 --echo # ============================================
---echo # TEST 1: PRIMARY KEY — point lookups & range
+--echo # TEST 1: PRIMARY KEY - point lookups & range
 --echo # ============================================
 --echo #
 

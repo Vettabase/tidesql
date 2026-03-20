@@ -1,6 +1,6 @@
 #
 # ============================================
-# TEST 1: Basic encrypted table — CRUD
+# TEST 1: Basic encrypted table - CRUD
 # ============================================
 #
 CREATE TABLE t_enc1 (

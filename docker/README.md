@@ -80,13 +80,13 @@ Specifying an engine name outside the optional list in either variable, or
 specifying an always-included engine in `EXCLUDE_ENGINES`, will cause the
 script to exit with an error.
 
-Example — build without Mroonga and RocksDB:
+Example - build without Mroonga and RocksDB:
 
 ```
 EXCLUDE_ENGINES=Mroonga,RocksDB bash docker/rebuild.sh
 ```
 
-Example — build with only Blackhole and RocksDB (all others excluded):
+Example - build with only Blackhole and RocksDB (all others excluded):
 
 ```
 INCLUDE_ENGINES=BLACKHOLE,ROCKSDB bash docker/rebuild.sh
@@ -113,7 +113,7 @@ always be supplied.  The scripts (rebuild.sh, setup.sh) default them to 11.8
 and the latest TidesDB release from GitHub respectively, so a bare
 "bash docker/rebuild.sh" works without any extra configuration.
 
-Example — include the test suite:
+Example - include the test suite:
 
 ```
   docker build \

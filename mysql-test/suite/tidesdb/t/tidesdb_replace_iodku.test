@@ -6,7 +6,7 @@
 
 --echo #
 --echo # ============================================
---echo # TEST 1: REPLACE INTO — PK only table
+--echo # TEST 1: REPLACE INTO - PK only table
 --echo # ============================================
 --echo #
 
@@ -35,7 +35,7 @@ DROP TABLE t_rep;
 
 --echo #
 --echo # ============================================
---echo # TEST 2: REPLACE INTO — PK + secondary index
+--echo # TEST 2: REPLACE INTO - PK + secondary index
 --echo #   (verifies old secondary index entries are
 --echo #   properly cleaned up)
 --echo # ============================================
@@ -71,7 +71,7 @@ DROP TABLE t_rep_idx;
 
 --echo #
 --echo # ============================================
---echo # TEST 3: INSERT ON DUPLICATE KEY UPDATE — PK
+--echo # TEST 3: INSERT ON DUPLICATE KEY UPDATE - PK
 --echo # ============================================
 --echo #
 
