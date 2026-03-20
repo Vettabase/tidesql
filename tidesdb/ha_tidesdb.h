@@ -78,7 +78,7 @@ static constexpr float TIDESDB_SKIP_LIST_PROB_DIV = 100.0f;
 static constexpr time_t TIDESDB_TTL_NONE = (time_t)-1;
 
 /* ----- Default block cache size (bytes) ------------------------------------------------------- */
-static constexpr ulonglong TIDESDB_DEFAULT_BLOCK_CACHE = 256ULL * 1024 * 1024;
+static constexpr ulonglong TIDESDB_DEFAULT_BLOCK_CACHE = 256ULL * 1024 * 1024; /* 256M */
 
 /*
   TidesDB_share -- shared state for one table, visible to ALL handler objects.

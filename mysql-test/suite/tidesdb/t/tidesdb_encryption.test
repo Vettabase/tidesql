@@ -4,7 +4,7 @@
 
 --echo #
 --echo # ============================================
---echo # TEST 1: Basic encrypted table — CRUD
+--echo # TEST 1: Basic encrypted table - CRUD
 --echo # ============================================
 --echo #
 

@@ -3,7 +3,7 @@
 #
 #
 # ============================================
-# TEST 1: System variables — verify defaults
+# TEST 1: System variables - verify defaults
 # ============================================
 #
 SHOW VARIABLES LIKE 'tidesdb_flush_threads';

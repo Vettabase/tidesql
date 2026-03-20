@@ -1,7 +1,7 @@
 DROP TABLE IF EXISTS t_pk, t_autoinc, t_secidx, t_combined;
 #
 # ============================================
-# TEST 1: PRIMARY KEY — point lookups & range
+# TEST 1: PRIMARY KEY - point lookups & range
 # ============================================
 #
 CREATE TABLE t_pk (

@@ -122,9 +122,8 @@ static handlerton *tidesdb_hton;
   multi-table transactions.
 */
 
-/* Number of hash partitions -- each has its own mutex.
-   Higher values reduce contention between unrelated rows. */
-static constexpr uint TDB_LOCK_PARTITIONS = 256;
+/* Number of hash partitions for the row lock table.
+   Configured via tidesdb_row_lock_stripes sysvar (default 1024). */
 
 /* Row lock entry in the hash table */
 struct tdb_row_lock_t
@@ -148,12 +147,12 @@ struct tdb_lock_partition_t
 };
 
 static tdb_lock_partition_t *lock_partitions = NULL;
-static ulong srv_row_lock_stripes = 1024; /* kept for sysvar compat, not used functionally */
+static ulong srv_row_lock_stripes = 1024;
 
 static inline uint tdb_lock_part(const uchar *key, uint len)
 {
     uint64_t h = XXH3_64bits(key, len);
-    return (uint)(h % TDB_LOCK_PARTITIONS);
+    return (uint)(h % srv_row_lock_stripes);
 }
 
 /* Find or create a lock entry in the partition's hash chain.
@@ -309,7 +308,7 @@ static const char *ha_tidesdb_exts[] = {NullS};
 static ulong srv_flush_threads = 4;
 static ulong srv_compaction_threads = 4;
 static ulong srv_log_level = 0;                                      /* TDB_LOG_DEBUG */
-static ulonglong srv_block_cache_size = TIDESDB_DEFAULT_BLOCK_CACHE; /* 256MB */
+static ulonglong srv_block_cache_size = TIDESDB_DEFAULT_BLOCK_CACHE; /* 256M */
 static ulong srv_max_open_sstables = 256;
 static ulonglong srv_max_memory_usage = 0; /* 0 = auto (library decides) */
 static my_bool srv_log_to_file = 1;        /* write TidesDB logs to file (default: yes) */
@@ -1406,12 +1405,14 @@ static int tidesdb_init_func(void *p)
 
     mysql_mutex_init(0, &last_conflict_mutex, MY_MUTEX_INIT_FAST);
 
-    /* Initialize partitioned lock table for pessimistic row locking */
+    /* Initialize partitioned lock table for pessimistic row locking.
+       Partition count comes from tidesdb_row_lock_stripes sysvar. */
     lock_partitions = (tdb_lock_partition_t *)my_malloc(
-        PSI_NOT_INSTRUMENTED, TDB_LOCK_PARTITIONS * sizeof(tdb_lock_partition_t), MYF(MY_ZEROFILL));
+        PSI_NOT_INSTRUMENTED, srv_row_lock_stripes * sizeof(tdb_lock_partition_t),
+        MYF(MY_ZEROFILL));
     if (lock_partitions)
     {
-        for (uint i = 0; i < TDB_LOCK_PARTITIONS; i++)
+        for (ulong i = 0; i < srv_row_lock_stripes; i++)
         {
             mysql_mutex_init(0, &lock_partitions[i].mutex, MY_MUTEX_INIT_FAST);
             lock_partitions[i].chain = NULL;
@@ -1482,7 +1483,7 @@ static int tidesdb_deinit_func(void *p)
     mysql_mutex_destroy(&last_conflict_mutex);
     if (lock_partitions)
     {
-        for (uint i = 0; i < TDB_LOCK_PARTITIONS; i++)
+        for (ulong i = 0; i < srv_row_lock_stripes; i++)
         {
             /* Free all lock entries in the hash chain */
             tdb_row_lock_t *e = lock_partitions[i].chain;
@@ -2079,17 +2080,17 @@ check_result_t ha_tidesdb::icp_check_secondary(const uint8_t *ik, size_t iks, ui
            like DECIMAL, VARCHAR, multi-byte CHAR).  Fall back to a full PK
            row fetch so ALL columns are available for condition evaluation.
            This is more expensive than pure ICP (still does the PK lookup)
-           but is correct, the server won't re-evaluate pushed conditions. */
+           but is correct - the server won't re-evaluate pushed conditions. */
         if (iks > idx_col_len)
         {
             const uchar *pk = ik + idx_col_len;
             uint pk_len = (uint)(iks - idx_col_len);
             if (fetch_row_by_pk(scan_txn, pk, pk_len, buf) != 0)
-                return CHECK_POS; /* PK lookup failed, accept row, let caller handle */
+                return CHECK_POS; /* PK lookup failed - accept row, let caller handle */
         }
         else
         {
-            return CHECK_POS; /* malformed key, accept */
+            return CHECK_POS; /* malformed key - accept */
         }
     }
 
@@ -2646,12 +2647,10 @@ int ha_tidesdb::fetch_row_by_pk(tidesdb_txn_t *txn, const uchar *pk, uint pk_len
     }
     else
     {
-        /* Copy into reusable get_val_buf_ (retains heap capacity across
-           calls) then free the API buffer.  For BLOBs, last_row must
-           hold the data so Field_blob pointers remain valid. */
-        get_val_buf_.assign((const char *)value, value_size);
+        /* Copy into last_row which keeps Field_blob pointers valid.
+           Assign directly to avoid a redundant intermediate copy. */
+        last_row.assign((const char *)value, value_size);
         tidesdb_free(value);
-        last_row = get_val_buf_;
         deserialize_row(buf, last_row);
     }
     memcpy(current_pk_buf_, pk, pk_len);
@@ -3083,9 +3082,10 @@ int ha_tidesdb::rnd_init(bool scan)
     }
     scan_txn = stmt_txn;
 
-    THD *thd = ha_thd();
-    tidesdb_trx_t *trx = (tidesdb_trx_t *)thd_get_ha_data(thd, ht);
-    uint64_t cur_gen = trx ? trx->txn_generation : 0;
+    /* Use cached trx pointer (set in external_lock) to avoid
+       ha_thd() virtual dispatch + thd_get_ha_data() hash lookup
+       on every scan init - this is a hot path in nested-loop joins. */
+    uint64_t cur_gen = cached_trx_ ? cached_trx_->txn_generation : 0;
 
     if (scan_iter &&
         (scan_iter_cf_ != share->cf || scan_iter_txn_ != scan_txn || scan_iter_txn_gen_ != cur_gen))
@@ -3107,9 +3107,6 @@ int ha_tidesdb::rnd_init(bool scan)
         scan_iter_cf_ = share->cf;
         scan_iter_txn_ = scan_txn;
         scan_iter_txn_gen_ = cur_gen;
-    }
-    else
-    {
     }
 
     /* We seek past meta keys to the first data key */
@@ -3172,7 +3169,6 @@ int ha_tidesdb::rnd_pos(uchar *buf, uchar *pos)
 int ha_tidesdb::index_init(uint idx, bool sorted)
 {
     DBUG_ENTER("ha_tidesdb::index_init");
-    THD *thd = ha_thd();
     active_index = idx;
     idx_pk_exact_done_ = false;
     scan_dir_ = DIR_NONE;
@@ -3207,9 +3203,12 @@ int ha_tidesdb::index_init(uint idx, bool sorted)
        If the txn changed (e.g. after COMMIT created a new one), the
        iterator holds a stale txn pointer and must be recreated.
        We compare both the pointer and a monotonic generation counter
-       because the allocator can reuse the same address for a new txn. */
-    tidesdb_trx_t *trx = (tidesdb_trx_t *)thd_get_ha_data(thd, ht);
-    uint64_t cur_gen = trx ? trx->txn_generation : 0;
+       because the allocator can reuse the same address for a new txn.
+
+       Use cached_trx_ (set in external_lock) to avoid ha_thd() virtual
+       dispatch + thd_get_ha_data() hash lookup on every iteration of
+       the outer loop in nested-loop joins. */
+    uint64_t cur_gen = cached_trx_ ? cached_trx_->txn_generation : 0;
 
     if (scan_iter &&
         (scan_iter_cf_ != target_cf || scan_iter_txn_ != scan_txn || scan_iter_txn_gen_ != cur_gen))
@@ -3241,9 +3240,7 @@ int ha_tidesdb::ensure_scan_iter()
     {
         scan_iter_cf_ = scan_cf_;
         scan_iter_txn_ = scan_txn;
-        THD *thd = ha_thd();
-        tidesdb_trx_t *trx = (tidesdb_trx_t *)thd_get_ha_data(thd, ht);
-        scan_iter_txn_gen_ = trx ? trx->txn_generation : 0;
+        scan_iter_txn_gen_ = cached_trx_ ? cached_trx_->txn_generation : 0;
         return 0;
     }
     return tdb_rc_to_ha(rc, "ensure_scan_iter");
@@ -3297,7 +3294,7 @@ int ha_tidesdb::index_read_map(uchar *buf, const uchar *key, key_part_map keypar
                    and this is a write-intent read (UPDATE, DELETE, or
                    SELECT ... FOR UPDATE).  Autocommit statements must also
                    participate so they block on locks held by multi-statement
-                   transactions, otherwise an autocommit UPDATE silently
+                   transactions - otherwise an autocommit UPDATE silently
                    bypasses a FOR UPDATE lock and causes commit conflicts. */
                 if (unlikely(srv_pessimistic_locking) && stmt_has_write_lock_)
                 {
@@ -3811,7 +3808,7 @@ int ha_tidesdb::update_row(const uchar *old_data, const uchar *new_data)
     memcpy(old_pk, current_pk_buf_, old_pk_len);
 
     /* Row locks are acquired in index_read_map() for SELECT ... FOR UPDATE.
-       No need to acquire here, the row is already locked from the preceding
+       No need to acquire here - the row is already locked from the preceding
        locking read.  For plain UPDATE without FOR UPDATE, the operation is
        atomic (single autocommit statement) and no lock is needed. */
 
@@ -4200,7 +4197,25 @@ int ha_tidesdb::info(uint flag)
             {
                 if (is_pk || is_unique)
                 {
-                    key->rec_per_key[j] = 1;
+                    if (j + 1 >= key->user_defined_key_parts)
+                    {
+                        /* Full unique key - exactly 1 row per distinct value */
+                        key->rec_per_key[j] = 1;
+                    }
+                    else
+                    {
+                        /* Intermediate prefix of a composite unique key.
+                           Estimate assuming uniform distribution:
+                             cardinality(prefix_k) ≈ total^(k/N)
+                             rec_per_key[j] = total^((N - j - 1) / N)
+                           E.g. for PK(a,b,c) with 300K rows:
+                             rec_per_key[0] ≈ 4481  (per distinct a)
+                             rec_per_key[1] ≈ 67    (per distinct a,b)
+                             rec_per_key[2] = 1     (unique)          */
+                        uint N = key->user_defined_key_parts;
+                        double rpk = pow((double)stats.records, (double)(N - j - 1) / (double)N);
+                        key->rec_per_key[j] = (ulong)MY_MAX((ulong)rpk, 1);
+                    }
                 }
                 else if (j + 1 == key->user_defined_key_parts)
                 {
@@ -4213,7 +4228,17 @@ int ha_tidesdb::info(uint flag)
                 }
                 else
                 {
-                    key->rec_per_key[j] = (ulong)MY_MIN(stats.records / 4 + 1, stats.records);
+                    /* Intermediate prefix of a non-unique index.
+                       Geometrically interpolate between stats.records
+                       (single leading column) and the last-part rec_per_key.
+                       Formula: total / (total/last_rpk)^((j+1)/N) */
+                    ulong last_rpk =
+                        (cached_rpk > 0) ? cached_rpk : (ulong)(stats.records / 10 + 1);
+                    uint N = key->user_defined_key_parts;
+                    double base = (last_rpk > 0) ? (double)stats.records / (double)last_rpk
+                                                 : (double)stats.records;
+                    double rpk = (double)stats.records / pow(base, (double)(j + 1) / (double)N);
+                    key->rec_per_key[j] = (ulong)MY_MAX(MY_MIN((ulong)rpk, stats.records), 1);
                 }
             }
         }
@@ -4590,6 +4615,40 @@ ha_rows ha_tidesdb::records_in_range(uint inx, const key_range *min_key, const k
     ha_rows est = (ha_rows)(total * fraction);
     if (est == 0) est = 1; /* never return 0 -- optimizer treats it as "empty" */
 
+    /* Sanity check: when both bounds are provided but the estimated fraction
+       is very high (>0.8), tidesdb_range_cost is likely unreliable - this
+       happens with memtable-only data where the cost function cannot
+       distinguish a narrow range from a full scan.
+       Fall back to a rec_per_key-based estimate for the key prefix. */
+    if (min_key && max_key && fraction > 0.8)
+    {
+        KEY *ki = &table->key_info[inx];
+        uint parts = my_count_bits(min_key->keypart_map);
+        if (parts > 0 && parts <= ki->user_defined_key_parts)
+        {
+            ulong rpk = ki->rec_per_key[parts - 1];
+            if (rpk > 0)
+            {
+                ha_rows capped;
+                if (lo_len == hi_len && memcmp(lo_buf, hi_buf, lo_len) == 0)
+                {
+                    /* Point equality - use rec_per_key directly */
+                    capped = (ha_rows)rpk;
+                }
+                else
+                {
+                    /* Range scan - multiply rec_per_key by a conservative
+                       range-width factor.  Typical OLTP ranges span tens of
+                       key values; 20× keeps the estimate tight while still
+                       being vastly better than the unreliable full ratio. */
+                    capped = (ha_rows)rpk * 20;
+                    if (capped > total / 2) capped = total / 2;
+                }
+                if (capped < est) est = MY_MAX(capped, 1);
+            }
+        }
+    }
+
     return est;
 }
 
@@ -4843,7 +4902,7 @@ THR_LOCK_DATA **ha_tidesdb::store_lock(THD *thd, THR_LOCK_DATA **to, enum thr_lo
        Instead we use the lock_type directly.  This means UPDATE/DELETE
        statements also set stmt_has_write_lock_=true, but that's OK
        because we removed lock acquisition from update_row()/delete_row()
-       only index_read_map() acquires pessimistic locks now, and only
+       - only index_read_map() acquires pessimistic locks now, and only
        for PK exact matches (the SELECT ... FOR UPDATE pattern). */
     if (lock_type == TL_READ_WITH_SHARED_LOCKS || lock_type >= TL_FIRST_WRITE)
     {
@@ -4897,7 +4956,7 @@ enum_alter_inplace_result ha_tidesdb::check_if_supported_inplace_alter(
        server-level MDL blocking. */
     if (!(flags & ~(TIDESDB_INSTANT | TIDESDB_INPLACE_INDEX)))
     {
-        /* Changing PK requires full rebuild */
+        /**** Changing PK requires full rebuild */
         if (flags & (ALTER_ADD_PK_INDEX | ALTER_DROP_PK_INDEX))
         {
             ha_alter_info->unsupported_reason = "TidesDB cannot change PRIMARY KEY inplace";
@@ -5021,7 +5080,7 @@ bool ha_tidesdb::inplace_alter_table(TABLE *altered_table, Alter_inplace_info *h
        We use the altered_table's key_info for building index keys,
        since that matches the new key numbering. */
 
-    /* Always use READ_COMMITTED for index population.  The scan reads
+    /* We always use READ_COMMITTED for index population.  The scan reads
        potentially millions of rows; higher isolation levels would track
        each key in the read-set, causing unbounded memory growth.  Index
        builds are DDL and never need OCC conflict detection. */
@@ -5149,13 +5208,13 @@ bool ha_tidesdb::inplace_alter_table(TABLE *altered_table, Alter_inplace_info *h
                 pos += kp->length;
             }
 
-            /* Check UNIQUE constraint before inserting */
+            /* We check UNIQUE constraint before inserting */
             if (idx_is_unique[a])
             {
                 std::string prefix((const char *)ik, pos);
                 if (!idx_seen[a].insert(prefix).second)
                 {
-                    /* Duplicate found -- abort the ALTER */
+                    /* We found a duplicate -- abort the ALTER */
                     tidesdb_iter_free(iter);
                     tidesdb_txn_rollback(txn);
                     tidesdb_txn_free(txn);
@@ -5208,12 +5267,12 @@ bool ha_tidesdb::inplace_alter_table(TABLE *altered_table, Alter_inplace_info *h
             }
             tidesdb_iter_free(iter);
 
-            /* Reset reuses the txn with READ_COMMITTED -- index builds
+            /* We reset the txn with READ_COMMITTED -- index builds
                don't need snapshot consistency across batches. */
             int rrc = tidesdb_txn_reset(txn, TDB_ISOLATION_READ_COMMITTED);
             if (rrc != TDB_SUCCESS)
             {
-                /* Reset failed -- fall back to free+begin */
+                /* We reset failed -- fall back to free+begin */
                 tidesdb_txn_free(txn);
                 txn = NULL;
                 rc = tidesdb_txn_begin_with_isolation(tdb_global, TDB_ISOLATION_READ_COMMITTED,
@@ -5275,8 +5334,8 @@ bool ha_tidesdb::inplace_alter_table(TABLE *altered_table, Alter_inplace_info *h
 
 /*
   Commit or rollback the inplace ALTER.
-  On commit    -- drop old index CFs, update share->idx_cfs for new table shape.
-  On rollback  -- drop newly created CFs.
+  On commit       drop old index CFs, update share->idx_cfs for new table shape.
+  On rollback     drop newly created CFs.
 */
 bool ha_tidesdb::commit_inplace_alter_table(TABLE *altered_table, Alter_inplace_info *ha_alter_info,
                                             bool commit)
@@ -5289,7 +5348,7 @@ bool ha_tidesdb::commit_inplace_alter_table(TABLE *altered_table, Alter_inplace_
 
     if (!ctx) DBUG_RETURN(false);
 
-    /* Free any cached iterators before dropping CFs.  The connection's
+    /* We free any cached iterators before dropping CFs.  The connection's
        scan_iter and dup_iter_cache_ may hold merge-heap references to
        SSTables in CFs about to be dropped -- freeing them first avoids
        use-after-free / heap corruption. */
@@ -5380,7 +5439,7 @@ bool ha_tidesdb::commit_inplace_alter_table(TABLE *altered_table, Alter_inplace_
             }
         }
 
-        /* Update share-level cached options that are read from table options */
+        /* We update share-level cached options that are read from table options */
         if (TDB_TABLE_OPTIONS(altered_table))
         {
             uint iso_idx = TDB_TABLE_OPTIONS(altered_table)->isolation_level;
@@ -5573,8 +5632,8 @@ maria_declare_plugin(tidesdb){
     PLUGIN_LICENSE_GPL,
     tidesdb_init_func,
     tidesdb_deinit_func,
-    0x40000,
+    0x40001,
     NULL,
     tidesdb_system_variables,
-    "4.0.0",
+    "4.0.1",
     MariaDB_PLUGIN_MATURITY_GAMMA} maria_declare_plugin_end;

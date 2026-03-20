@@ -27,7 +27,7 @@ SHOW CREATE TABLE t1;
 
 --echo #
 --echo # ============================================
---echo # TEST 2: INSERT — single row
+--echo # TEST 2: INSERT - single row
 --echo # ============================================
 --echo #
 
@@ -38,7 +38,7 @@ SELECT COUNT(*) AS cnt FROM t1;
 
 --echo #
 --echo # ============================================
---echo # TEST 3: INSERT — multiple rows at once
+--echo # TEST 3: INSERT - multiple rows at once
 --echo # ============================================
 --echo #
 
@@ -83,7 +83,7 @@ SELECT SUM(id) AS sum_id FROM t1;
 
 --echo #
 --echo # ============================================
---echo # TEST 7: UPDATE — single row via WHERE
+--echo # TEST 7: UPDATE - single row via WHERE
 --echo # ============================================
 --echo #
 
@@ -92,7 +92,7 @@ SELECT * FROM t1 WHERE id = 1;
 
 --echo #
 --echo # ============================================
---echo # TEST 8: UPDATE — multiple rows
+--echo # TEST 8: UPDATE - multiple rows
 --echo # ============================================
 --echo #
 
@@ -101,7 +101,7 @@ SELECT id, bio FROM t1 WHERE id IN (2, 4);
 
 --echo #
 --echo # ============================================
---echo # TEST 9: UPDATE — all rows (no WHERE)
+--echo # TEST 9: UPDATE - all rows (no WHERE)
 --echo # ============================================
 --echo #
 
@@ -110,7 +110,7 @@ SELECT id, name FROM t1;
 
 --echo #
 --echo # ============================================
---echo # TEST 10: DELETE — single row
+--echo # TEST 10: DELETE - single row
 --echo # ============================================
 --echo #
 
@@ -120,7 +120,7 @@ SELECT * FROM t1;
 
 --echo #
 --echo # ============================================
---echo # TEST 11: DELETE — multiple rows via WHERE
+--echo # TEST 11: DELETE - multiple rows via WHERE
 --echo # ============================================
 --echo #
 
@@ -138,7 +138,7 @@ SELECT * FROM t1 WHERE id = 999;
 
 --echo #
 --echo # ============================================
---echo # TEST 13: DELETE — all remaining rows via DELETE
+--echo # TEST 13: DELETE - all remaining rows via DELETE
 --echo # ============================================
 --echo #
 
@@ -236,7 +236,7 @@ INSERT INTO tb VALUES (1, 'tb_one'), (3, 'tb_three');
 SELECT * FROM ta;
 SELECT * FROM tb;
 
-# Cross-table query (nested loop join — both do full scans)
+# Cross-table query (nested loop join - both do full scans)
 SELECT ta.a, ta.val, tb.b, tb.val FROM ta, tb WHERE ta.a = tb.b;
 
 DROP TABLE ta, tb;

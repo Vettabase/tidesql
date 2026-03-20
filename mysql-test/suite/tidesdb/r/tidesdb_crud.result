@@ -24,7 +24,7 @@ t1	CREATE TABLE `t1` (
 ) ENGINE=TidesDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci
 #
 # ============================================
-# TEST 2: INSERT — single row
+# TEST 2: INSERT - single row
 # ============================================
 #
 INSERT INTO t1 VALUES (1, 'Alice', 95.50, 'First student', '2000-01-15');
@@ -36,7 +36,7 @@ cnt
 1
 #
 # ============================================
-# TEST 3: INSERT — multiple rows at once
+# TEST 3: INSERT - multiple rows at once
 # ============================================
 #
 INSERT INTO t1 VALUES
@@ -108,7 +108,7 @@ sum_id
 15
 #
 # ============================================
-# TEST 7: UPDATE — single row via WHERE
+# TEST 7: UPDATE - single row via WHERE
 # ============================================
 #
 UPDATE t1 SET score = 99.99 WHERE id = 1;
@@ -117,7 +117,7 @@ id	name	score	bio	born
 1	Alice	99.99	First student	2000-01-15
 #
 # ============================================
-# TEST 8: UPDATE — multiple rows
+# TEST 8: UPDATE - multiple rows
 # ============================================
 #
 UPDATE t1 SET bio = 'Updated bio' WHERE id IN (2, 4);
@@ -127,7 +127,7 @@ id	bio
 4	Updated bio
 #
 # ============================================
-# TEST 9: UPDATE — all rows (no WHERE)
+# TEST 9: UPDATE - all rows (no WHERE)
 # ============================================
 #
 UPDATE t1 SET name = CONCAT(name, '!');
@@ -140,7 +140,7 @@ id	name
 5	Eve!
 #
 # ============================================
-# TEST 10: DELETE — single row
+# TEST 10: DELETE - single row
 # ============================================
 #
 DELETE FROM t1 WHERE id = 3;
@@ -155,7 +155,7 @@ id	name	score	bio	born
 5	Eve!	67.80	Fifth student	2002-08-12
 #
 # ============================================
-# TEST 11: DELETE — multiple rows via WHERE
+# TEST 11: DELETE - multiple rows via WHERE
 # ============================================
 #
 DELETE FROM t1 WHERE score < 90;
@@ -175,7 +175,7 @@ SELECT * FROM t1 WHERE id = 999;
 id	name	score	bio	born
 #
 # ============================================
-# TEST 13: DELETE — all remaining rows via DELETE
+# TEST 13: DELETE - all remaining rows via DELETE
 # ============================================
 #
 DELETE FROM t1;

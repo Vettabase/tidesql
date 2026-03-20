@@ -1,6 +1,6 @@
 #
 # ============================================
-# TEST 1: REPLACE INTO — PK only table
+# TEST 1: REPLACE INTO - PK only table
 # ============================================
 #
 CREATE TABLE t_rep (
@@ -40,7 +40,7 @@ id	val
 DROP TABLE t_rep;
 #
 # ============================================
-# TEST 2: REPLACE INTO — PK + secondary index
+# TEST 2: REPLACE INTO - PK + secondary index
 #   (verifies old secondary index entries are
 #   properly cleaned up)
 # ============================================
@@ -80,7 +80,7 @@ id	k	val
 DROP TABLE t_rep_idx;
 #
 # ============================================
-# TEST 3: INSERT ON DUPLICATE KEY UPDATE — PK
+# TEST 3: INSERT ON DUPLICATE KEY UPDATE - PK
 # ============================================
 #
 CREATE TABLE t_iodku (
