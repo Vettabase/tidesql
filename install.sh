@@ -50,6 +50,7 @@
 #   --skip-tidesdb              Skip TidesDB library build (use if already installed)
 #   --skip-engines  ENGINES     Comma-separated list of storage engines to skip
 #   --list-engines              List storage engines that can be skipped and exit
+#   --rebuild-plugin             Rebuild only the TidesDB plugin (fast dev cycle)
 #   --pgo                       Enable Profile-Guided Optimization (3-phase build)
 #   --help                      Show this help message
 #
@@ -163,6 +164,7 @@ BUILD_DIR="${DEFAULT_BUILD_DIR}"
 JOBS="$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)"
 SKIP_DEPS=false
 SKIP_TIDESDB=false
+REBUILD_PLUGIN=false
 PGO_ENABLED=false
 SKIP_ENGINES=""
 
@@ -240,6 +242,7 @@ while [[ $# -gt 0 ]]; do
         --jobs)             JOBS="$2";              shift 2 ;;
         --skip-deps)        SKIP_DEPS=true;         shift   ;;
         --skip-tidesdb)     SKIP_TIDESDB=true;      shift   ;;
+        --rebuild-plugin)   REBUILD_PLUGIN=true;    shift   ;;
         --skip-engines)     SKIP_ENGINES="$2";      shift 2 ;;
         --list-engines)     list_engines ;;
         --pgo)              PGO_ENABLED=true;       shift   ;;
@@ -825,6 +828,74 @@ print_summary() {
     draw_box "${GREEN}" "Installation Complete!" _summary_lines
 }
 
+# ── Rebuild only the TidesDB plugin (fast dev cycle) ────────────────
+rebuild_plugin() {
+    local mariadb_src="${BUILD_DIR}/mariadb-server"
+    local mariadb_build="${mariadb_src}/build"
+
+    if [[ ! -d "${mariadb_build}" ]]; then
+        die "MariaDB build directory not found at ${mariadb_build}.\n" \
+            "  Run a full install first before using --rebuild-plugin."
+    fi
+
+    # Re-copy plugin source & test suite into the existing source tree
+    info "Copying TidesDB plugin source into MariaDB source tree..."
+    cp -r "${SCRIPT_DIR}/tidesdb" "${mariadb_src}/storage/"
+    cp -r "${SCRIPT_DIR}/mysql-test/suite/tidesdb" "${mariadb_src}/mysql-test/suite/"
+
+    # Point cmake at the TidesDB library
+    export TIDESDB_ROOT="${TIDESDB_PREFIX}"
+
+    # Build just the plugin target
+    info "Building tidesdb plugin target (${JOBS} jobs)..."
+    cmake --build "${mariadb_build}" --target tidesdb --parallel "${JOBS}"
+
+    # Find the built .so/.dylib/.dll and copy it into the installed plugin dir
+    local plugin_ext="so"
+    [[ "$OS" == "macos" ]]   && plugin_ext="dylib"
+    [[ "$OS" == "windows" ]] && plugin_ext="dll"
+
+    local built_so
+    built_so="$(find "${mariadb_build}" -name "ha_tidesdb.${plugin_ext}" -print -quit 2>/dev/null)"
+    if [[ -z "$built_so" ]]; then
+        die "Could not find ha_tidesdb.${plugin_ext} in ${mariadb_build}"
+    fi
+
+    local plugin_dir="${MARIADB_PREFIX}/lib/plugin"
+    if [[ ! -d "$plugin_dir" ]]; then
+        plugin_dir="${MARIADB_PREFIX}/lib64/plugin"
+    fi
+    if [[ ! -d "$plugin_dir" ]]; then
+        die "Plugin directory not found at ${MARIADB_PREFIX}/lib/plugin or lib64/plugin"
+    fi
+
+    info "Installing ha_tidesdb.${plugin_ext} → ${plugin_dir}/"
+    run_privileged cp -f "${built_so}" "${plugin_dir}/"
+
+    ok "Plugin rebuilt and installed"
+
+    # Determine config file & socket for restart hint
+    local cnf_file="${MARIADB_PREFIX}/my.cnf"
+    [[ "$OS" == "windows" ]] && cnf_file="${MARIADB_PREFIX}/my.ini"
+
+    local _rebuild_lines=(
+        ""
+        "Plugin rebuilt : ${CYAN}${plugin_dir}/ha_tidesdb.${plugin_ext}${NC}"
+        ""
+        "Restart MariaDB to pick up the new plugin:"
+        "  ${MARIADB_PREFIX}/bin/mariadb-admin shutdown"
+        "  ${MARIADB_PREFIX}/bin/mariadbd-safe \\"
+        "    --defaults-file=${cnf_file} &"
+        ""
+        "Run TidesDB test suite:"
+        "  cd ${mariadb_build}/mysql-test"
+        "  perl mtr --suite=tidesdb --parallel=4"
+        ""
+    )
+
+    draw_box "${GREEN}" "Plugin Rebuild Complete" _rebuild_lines
+}
+
 # ── PGO Phase 1 -- Instrument build ─────────────────────────────────
 pgo_instrument() {
     info "PGO Phase 1/3: Building MariaDB with profiling instrumentation..."
@@ -1027,6 +1098,12 @@ pgo_optimize() {
 
 main() {
     mkdir -p "${BUILD_DIR}"
+
+    # Fast path: rebuild only the plugin and exit
+    if $REBUILD_PLUGIN; then
+        rebuild_plugin
+        return
+    fi
 
     install_deps
     build_tidesdb

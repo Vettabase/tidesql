@@ -4,12 +4,12 @@
 # If MARIADB_PREFIX/data/mysql does not exist the data directory is initialised
 # with mariadb-install-db.
 # The server is then started via mariadbd-safe.
-set -eo pipefail
+set -euo pipefail
 
 MARIADB_PREFIX="${MARIADB_PREFIX:-/usr/local/mariadb}"
 DATADIR="${MARIADB_PREFIX}/data/default"
 
-# ── Initialise data directory if it has not been set up yet ────────────────
+# Initialise data directory if it has not been set up yet 
 if [ ! -d "${DATADIR}/mysql" ]; then
     echo "[entrypoint] Initialising MariaDB data directory..."
 
@@ -41,7 +41,7 @@ if [ ! -d "${DATADIR}/mysql" ]; then
     echo "[entrypoint] Data directory initialised."
 fi
 
-# ── Start MariaDB ───────────────────────────────────────────────────────────
+# Start MariaDB ─
 # Ensure runtime directories exist with correct ownership (handles volume mounts).
 chown -R mysql:mysql /etc/mysql
 mkdir -p "${DATADIR}" "${MARIADB_PREFIX}/log"

@@ -61,6 +61,7 @@ RUN git clone --depth 1 --branch "${MARIADB_VERSION}" \
     fi
 
 # ── 5. Configure, build, and install MariaDB ───────────────────────────────
+# Re-declare build ARGs so they are visible in this layer (Docker scoping rule).
 ARG WITH_TESTS=0
 ARG DISABLED_ENGINES=""
 COPY docker/ubuntu/utils/cmake_exclude_engines.sh /usr/local/bin/cmake_exclude_engines.sh
@@ -103,8 +104,8 @@ COPY docker/ubuntu/entrypoint.sh /usr/local/bin/tidesql-entrypoint.sh
 RUN chmod +x /usr/local/bin/tidesql-entrypoint.sh
 
 VOLUME /etc/mysql
-VOLUME /usr/local/mariadb/data
-VOLUME /usr/local/mariadb/log
+VOLUME ${MARIADB_PREFIX}/data
+VOLUME ${MARIADB_PREFIX}/log
 
 EXPOSE 3306
 

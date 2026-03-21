@@ -6,7 +6,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Configuration
 IMAGE_NAME=${IMAGE_NAME:-"tidesql"}
-TAG=${TAG:-"11.8-ubuntu"}
+TAG=${TAG:-"latest"}
 VOLUME_DATA="tidesql-data"
 VOLUME_CONF="tidesql-conf"
 VOLUME_LOG="tidesql-log"
