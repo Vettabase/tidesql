@@ -7,13 +7,13 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 # Configuration
 IMAGE_NAME=${IMAGE_NAME:-"tidesql"}
-TAG=${TAG:-"11.8-ubuntu"}
+TAG=${TAG:-"latest"}
 CONTAINER_NAME=${CONTAINER_NAME:-"tidesql"}
 VOLUME_DATA="tidesql-data"
 VOLUME_CONF="tidesql-conf"
 VOLUME_LOG="tidesql-log"
 
-# ── Storage engine selection ──────────────────────────────────────────────────
+# Storage engine selection 
 # Optional engines that can be excluded or selectively included.
 KNOWN_OPTIONAL_ENGINES="ARCHIVE BLACKHOLE CONNECT EXAMPLE FEDERATED FEDERATEDX MROONGA ROCKSDB S3 SPHINX SPIDER"
 # Engines that are always present in the build (cannot be excluded).
@@ -85,15 +85,15 @@ elif [ -n "${INCLUDE_ENGINES:-}" ]; then
     DISABLED_ENGINES="$_disabled"
 fi
 
-# ── Resolve MARIADB_VERSION and TIDESDB_VERSION ───────────────────────────────
+# Resolve MARIADB_VERSION and TIDESDB_VERSION 
 MARIADB_VERSION=${MARIADB_VERSION:-"11.8"}
 
 if [ -z "${TIDESDB_VERSION:-}" ]; then
     _tidesdb_latest=$(curl -fsSL "https://api.github.com/repos/tidesdb/tidesdb/releases/latest" 2>/dev/null \
         | grep '"tag_name":' | sed -E 's/.*"tag_name": *"([^"]+)".*/\1/')
     if [ -z "$_tidesdb_latest" ]; then
-        echo "Warning: Could not fetch latest TidesDB version from GitHub; falling back to v8.8.0." >&2
-        _tidesdb_latest="v8.8.0"
+        echo "Warning: Could not fetch latest TidesDB version from GitHub; falling back to v8.9.0." >&2
+        _tidesdb_latest="v8.9.0"
     fi
     TIDESDB_VERSION="$_tidesdb_latest"
 fi
@@ -115,8 +115,8 @@ docker run -d \
     --name "$CONTAINER_NAME" \
     -p 3306:3306 \
     -v "$VOLUME_CONF":/etc/mysql \
-    -v "$VOLUME_DATA":/usr/local/mariadb/data \
-    -v "$VOLUME_LOG":/usr/local/mariadb/log \
+    -v "$VOLUME_DATA":"${MARIADB_PREFIX:-/usr/local/mariadb}"/data \
+    -v "$VOLUME_LOG":"${MARIADB_PREFIX:-/usr/local/mariadb}"/log \
     "${IMAGE_NAME}:${TAG}"
 r=$?
 

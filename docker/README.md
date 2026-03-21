@@ -11,51 +11,30 @@ storage engine) in a container.
     from GitHub
 
 
-## Tree
-
-```
-docker/
-├── conf/
-│   └── my.cnf
-├── ubuntu/
-│   ├── utils/
-│   │   └── cmake_exclude_engines.sh
-│   ├── Dockerfile
-│   └── entrypoint.sh
-├── README.md
-├── cleanup.sh
-├── rebuild.sh
-└── setup.sh
-```
-
-This tree will start to make sense when we add more operating systems (RedHat family, Arch)
-and some optional configuration files.
-
-
 ## Building Images
 
 To make building less error-prone, the following scripts are available:
-- `docker/cleanpup.sh` removes the existing image, any container
+- `docker/cleanup.sh` removes the existing image, any container
   created from it, and associated volumes.
-- `docker/build.sh` builds the image. This includes compiling MariaDB and
+- `docker/setup.sh` builds the image. This includes compiling MariaDB and
   TidesDB so, depending on your hardware, can take 20-40 minutes. It also
   creates a new container so that the image can be tested immediately.
 - `docker/rebuild.sh` calls both, passing all necessary environment
-  variable.
+  variables.
 
 These scripts can be called from any path.
 
 Environment variables accepted by the scripts:
 
-- `IMAGE_NAME`: Name of the newly built image, default: tidesql
-- `TAG`: Image tag, default: 11.8-ubuntu
-- `CONTAINER_NAME`: Name of the container to be created, default: tidesql
-- `MARIADB_VERSION`: MariaDB version to build, default: 11.8
-- `TIDESDB_VERSION`: TidesDB release tag to build, default: latest from GitHub
+- `IMAGE_NAME` Name of the newly built image, default: tidesql
+- `TAG` Image tag, default: latest
+- `CONTAINER_NAME` Name of the container to be created, default: tidesql
+- `MARIADB_VERSION` MariaDB version to build, default: 11.8
+- `TIDESDB_VERSION` TidesDB release tag to build, default: latest from GitHub
 - `EXCLUDE_ENGINES`  Comma-separated list of optional engines to exclude from the
   build.  Engine names are case-insensitive.  Use `ALL` to include all optional
   engines.
-- `INCLUDE_ENGINES`: Comma-separated list of optional engines to include.
+- `INCLUDE_ENGINES` Comma-separated list of optional engines to include.
   All other optional engines are excluded. Engine names are case-insensitive.
 
 `EXCLUDE_ENGINES` and `INCLUDE_ENGINES` cannot be set at the same time.
@@ -108,20 +87,20 @@ Some of them currently cannot be changed by using the scripts.
                     INCLUDE_ENGINES in rebuild.sh (see REBUILD SCRIPT above).
 ```
 
-`MARIADB_VERSION and TIDESDB_VERSION have no default in the Dockerfile and must
-always be supplied.  The scripts (rebuild.sh, setup.sh) default them to 11.8
-and the latest TidesDB release from GitHub respectively, so a bare
-"bash docker/rebuild.sh" works without any extra configuration.
+`MARIADB_VERSION` and `TIDESDB_VERSION` have no default in the Dockerfile and
+must always be supplied.  The scripts (`rebuild.sh`, `setup.sh`) default them
+to `11.8` and the latest TidesDB release from GitHub respectively, so a bare
+`bash docker/rebuild.sh` works without any extra configuration.
 
 Example - include the test suite:
 
 ```
   docker build \
       -f docker/ubuntu/Dockerfile \
-      --build-arg MARIADB_VERSION=11.8 \
-      --build-arg TIDESDB_VERSION=v8.8.0 \
+      --build-arg MARIADB_VERSION=12.2.2 \
+      --build-arg TIDESDB_VERSION=v8.9.3 \
       --build-arg WITH_TESTS=1 \
-      -t tidesql:11.8-ubuntu-tests \
+      -t tidesql:12.2.2-ubuntu-tests \
       .
 ```
 
@@ -138,7 +117,7 @@ restarts:
       -v tidesql-conf:/etc/mysql \
       -v tidesql-data:/usr/local/mariadb/data \
       -v tidesql-log:/usr/local/mariadb/log \
-      tidesql:11.8-ubuntu
+      tidesql:latest
 ```
 
 On the first start the entrypoint initialises the data directory
@@ -191,32 +170,3 @@ docker stop tidesql
 docker rm   tidesql
 docker volume rm tidesql-conf tidesql-data tidesql-log
 ```
-
-## MariaDB Tree
-
-MariaDB is installed in `/usr/local/mariadb`.
-
-We configured MariaDB to use a clean directory tree:
-
-```
-/usr/local/mariadb
-├── data
-│   └── default        (regular storage engines write here)
-|   └── tidesdb-data   (TidesDB data files and LOG)
-└── log
-    ├── binlog files
-    ├── error.log
-    ├── slow.log
-    ├── general.log
-    └── sqlerr.log     (SQL Error Log)
-```
-
-
-## To Do
-
-- Automatically create any number of containers (including zero)
-- Support more systems
-- Support all MariaDB Long-Term Support versions and some rolling versions
-- Anonymous volume containing SQL scripts to run on startup
-- Optionally create a test schema
-
