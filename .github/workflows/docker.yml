@@ -1,15 +1,16 @@
 name: Docker
 
 on:
+  workflow_dispatch:
   push:
-    branches: [main]
+    branches: [main, master]
     paths:
       - 'docker/**'
       - 'tidesdb/**'
       - 'mysql-test/**'
       - '.github/workflows/docker.yml'
   pull_request:
-    branches: [main]
+    branches: [main, master]
     paths:
       - 'docker/**'
       - 'tidesdb/**'
