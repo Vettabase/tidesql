@@ -177,6 +177,41 @@ Files added to `conf/custom` (other than `00-example.cfg`) are not versioned
 and will not appear in git.
 
 
+## Initialisation Scripts
+
+The `/docker-entrypoint-initdb.d` directory is a volume that can be mapped to
+a local directory. Any `.sql` and `.sh` files placed there are executed
+automatically, in alphabetical order, every time a container starts — right
+after MariaDB is up and ready to accept connections.
+
+This is useful for:
+
+- Creating users or databases needed by your application.
+- Restoring a backup: place a dump file (e.g. `01-restore.sql`) in the
+  directory so that it is imported when a newly created container starts.
+  Remove the file (or unmap the volume) after the first start to avoid
+  re-running it on subsequent restarts.
+
+See `initdb.d/00-example.sql` for an annotated example. Copy it to a new file
+in the same directory and edit as needed.
+
+Files added to `initdb.d` (other than `00-example.sql`) are not versioned and
+will not appear in git.
+
+To map the directory to a local path when running a container:
+
+```
+docker run -d \
+    --name tidesql \
+    -p 3306:3306 \
+    -v tidesql-conf:/etc/mysql \
+    -v tidesql-data:/usr/local/mariadb/data \
+    -v tidesql-log:/usr/local/mariadb/log \
+    -v /path/to/your/initdb.d:/docker-entrypoint-initdb.d \
+    tidesql:latest
+```
+
+
 ## Stopping and Removing the Container
 
 ```
