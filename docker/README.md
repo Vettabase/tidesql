@@ -163,6 +163,20 @@ COMMIT;
 SELECT * FROM person;
 ```
 
+## Customising the Configuration
+
+Files placed in the `conf/custom` directory are loaded after the main
+`my.cnf`, so any settings they contain override the defaults. This directory
+is mounted as part of the `/etc/mysql` volume.
+
+See `conf/custom/00-example.cfg` for an example that shows how to override
+`sql_mode` and `old_mode`. Copy it to a new file (any name ending in `.cfg`)
+in the same directory and edit as needed.
+
+Files added to `conf/custom` (other than `00-example.cfg`) are not versioned
+and will not appear in git.
+
+
 ## Stopping and Removing the Container
 
 ```
