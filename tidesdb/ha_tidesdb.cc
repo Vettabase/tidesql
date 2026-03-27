@@ -20,6 +20,9 @@ extern "C"
 {
 #define XXH_INLINE_ALL
 #include <tidesdb/xxhash.h>
+#ifdef TIDESDB_WITH_S3
+#include <tidesdb/objstore_s3.h>
+#endif
 }
 
 #include <mysql/plugin.h>
@@ -88,6 +91,9 @@ static int tdb_rc_to_ha(int rc, const char *ctx)
             return HA_ERR_KEY_NOT_FOUND;
         case TDB_ERR_EXISTS:
             return HA_ERR_FOUND_DUPP_KEY;
+        case TDB_ERR_READONLY:
+            sql_print_warning("TIDESDB: %s: write rejected (replica mode)", ctx);
+            return HA_ERR_READ_ONLY_TRANSACTION;
         default:
             sql_print_warning("TIDESDB: %s: unexpected TidesDB error rc=%d", ctx, rc);
             return HA_ERR_GENERIC;
@@ -554,6 +560,115 @@ static MYSQL_SYSVAR_STR(data_home_dir, srv_data_home_dir, PLUGIN_VAR_RQCMDARG | 
                         "must be set before server startup (read-only)",
                         NULL, NULL, NULL);
 
+/* ******************** Object Store Configuration ******************** */
+
+/* Object store backend: 0=LOCAL (no object store), 1=S3 */
+static ulong srv_object_store_backend = 0;
+static const char *object_store_backend_names[] = {"LOCAL", "S3", NullS};
+static TYPELIB object_store_backend_typelib = {array_elements(object_store_backend_names) - 1,
+                                               "object_store_backend_typelib",
+                                               object_store_backend_names, NULL};
+static MYSQL_SYSVAR_ENUM(object_store_backend, srv_object_store_backend,
+                         PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_READONLY,
+                         "Object store backend (LOCAL=disabled, S3=S3-compatible)", NULL, NULL, 0,
+                         &object_store_backend_typelib);
+
+static char *srv_s3_endpoint = NULL;
+static MYSQL_SYSVAR_STR(s3_endpoint, srv_s3_endpoint, PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_READONLY,
+                        "S3 endpoint (e.g. s3.amazonaws.com or minio.local:9000)", NULL, NULL,
+                        NULL);
+
+static char *srv_s3_bucket = NULL;
+static MYSQL_SYSVAR_STR(s3_bucket, srv_s3_bucket, PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_READONLY,
+                        "S3 bucket name", NULL, NULL, NULL);
+
+static char *srv_s3_prefix = NULL;
+static MYSQL_SYSVAR_STR(s3_prefix, srv_s3_prefix, PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_READONLY,
+                        "S3 key prefix (e.g. production/db1/)", NULL, NULL, NULL);
+
+static char *srv_s3_access_key = NULL;
+static MYSQL_SYSVAR_STR(s3_access_key, srv_s3_access_key, PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_READONLY,
+                        "S3 access key ID", NULL, NULL, NULL);
+
+static char *srv_s3_secret_key = NULL;
+static MYSQL_SYSVAR_STR(s3_secret_key, srv_s3_secret_key, PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_READONLY,
+                        "S3 secret access key", NULL, NULL, NULL);
+
+static char *srv_s3_region = NULL;
+static MYSQL_SYSVAR_STR(s3_region, srv_s3_region, PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_READONLY,
+                        "S3 region (e.g. us-east-1, NULL for MinIO)", NULL, NULL, NULL);
+
+static my_bool srv_s3_use_ssl = 1;
+static MYSQL_SYSVAR_BOOL(s3_use_ssl, srv_s3_use_ssl, PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_READONLY,
+                         "Use HTTPS for S3 connections (default ON)", NULL, NULL, 1);
+
+static my_bool srv_s3_path_style = 0;
+static MYSQL_SYSVAR_BOOL(s3_path_style, srv_s3_path_style,
+                         PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_READONLY,
+                         "Use path-style S3 URLs (required for MinIO, default OFF)", NULL, NULL, 0);
+
+static ulonglong srv_objstore_local_cache_max = 0;
+static MYSQL_SYSVAR_ULONGLONG(
+    objstore_local_cache_max, srv_objstore_local_cache_max,
+    PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_READONLY,
+    "Maximum local cache size in bytes for object store mode (0=unlimited)", NULL, NULL, 0, 0,
+    ULONGLONG_MAX, 0);
+
+static ulonglong srv_objstore_wal_sync_threshold = 1048576;
+static MYSQL_SYSVAR_ULONGLONG(
+    objstore_wal_sync_threshold, srv_objstore_wal_sync_threshold,
+    PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_READONLY,
+    "Sync active WAL to object store when it grows by this many bytes (default 1MB, 0=disable)",
+    NULL, NULL, 1048576, 0, ULONGLONG_MAX, 0);
+
+static my_bool srv_objstore_wal_sync_on_commit = 0;
+static MYSQL_SYSVAR_BOOL(objstore_wal_sync_on_commit, srv_objstore_wal_sync_on_commit,
+                         PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_READONLY,
+                         "Upload WAL after every commit for RPO=0 replication (default OFF)", NULL,
+                         NULL, 0);
+
+static my_bool srv_replica_mode = 0;
+static MYSQL_SYSVAR_BOOL(replica_mode, srv_replica_mode, PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_READONLY,
+                         "Enable read-only replica mode (default OFF)", NULL, NULL, 0);
+
+static ulonglong srv_replica_sync_interval = 5000000;
+static MYSQL_SYSVAR_ULONGLONG(
+    replica_sync_interval, srv_replica_sync_interval, PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_READONLY,
+    "MANIFEST poll interval for replica sync in microseconds (default 5s)", NULL, NULL, 5000000,
+    100000, ULONGLONG_MAX, 0);
+
+/* Promote replica to primary -- trigger variable (like backup_dir) */
+static my_bool srv_promote_primary = 0;
+static void tidesdb_promote_primary_update(THD *thd, struct st_mysql_sys_var *, void *var_ptr,
+                                           const void *save)
+{
+    my_bool val = *static_cast<const my_bool *>(save);
+    if (!val) return; /* only act on SET ... = ON */
+
+    if (!tdb_global)
+    {
+        my_error(ER_UNKNOWN_ERROR, MYF(0));
+        return;
+    }
+
+    int rc = tidesdb_promote_to_primary(tdb_global);
+    if (rc == TDB_SUCCESS)
+    {
+        sql_print_information("TIDESDB: Replica promoted to primary successfully");
+    }
+    else
+    {
+        sql_print_error("TIDESDB: Failed to promote replica (err=%d)", rc);
+    }
+
+    /* reset to OFF so it can be triggered again */
+    *static_cast<my_bool *>(var_ptr) = 0;
+}
+
+static MYSQL_SYSVAR_BOOL(promote_primary, srv_promote_primary, PLUGIN_VAR_RQCMDARG,
+                         "Set to ON to promote this replica to primary (trigger, resets to OFF)",
+                         NULL, tidesdb_promote_primary_update, 0);
+
 /* ******************** Online backup via system variable ******************** */
 
 static char *srv_backup_dir = NULL;
@@ -718,6 +833,21 @@ static struct st_mysql_sys_var *tidesdb_system_variables[] = {
     MYSQL_SYSVAR(unified_memtable_write_buffer_size),
     MYSQL_SYSVAR(unified_memtable_sync_mode),
     MYSQL_SYSVAR(unified_memtable_sync_interval),
+    MYSQL_SYSVAR(object_store_backend),
+    MYSQL_SYSVAR(s3_endpoint),
+    MYSQL_SYSVAR(s3_bucket),
+    MYSQL_SYSVAR(s3_prefix),
+    MYSQL_SYSVAR(s3_access_key),
+    MYSQL_SYSVAR(s3_secret_key),
+    MYSQL_SYSVAR(s3_region),
+    MYSQL_SYSVAR(s3_use_ssl),
+    MYSQL_SYSVAR(s3_path_style),
+    MYSQL_SYSVAR(objstore_local_cache_max),
+    MYSQL_SYSVAR(objstore_wal_sync_threshold),
+    MYSQL_SYSVAR(objstore_wal_sync_on_commit),
+    MYSQL_SYSVAR(replica_mode),
+    MYSQL_SYSVAR(replica_sync_interval),
+    MYSQL_SYSVAR(promote_primary),
     NULL};
 
 /* ******************** Table options (per-table CF config) ******************** */
@@ -1313,7 +1443,7 @@ static bool tidesdb_show_status(handlerton *hton, THD *thd, stat_print_fn *print
     memset(&cache_st, 0, sizeof(cache_st));
     tidesdb_get_cache_stats(tdb_global, &cache_st);
 
-    char buf[4096];
+    char buf[8192];
     int pos = 0;
 
     pos += snprintf(buf + pos, sizeof(buf) - pos,
@@ -1362,6 +1492,25 @@ static bool tidesdb_show_status(handlerton *hton, THD *thd, stat_print_fn *print
     pos += snprintf(buf + pos, sizeof(buf) - pos, "Hit rate: %.1f%%\n", cache_st.hit_rate * 100.0);
     pos += snprintf(buf + pos, sizeof(buf) - pos, "Partitions: %lu\n",
                     (unsigned long)cache_st.num_partitions);
+
+    /* Object store stats */
+    if (db_st.object_store_enabled)
+    {
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "\n--- Object Store ---\n");
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "Connector: %s\n",
+                        db_st.object_store_connector ? db_st.object_store_connector : "unknown");
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "Total uploads: %lu\n",
+                        (unsigned long)db_st.total_uploads);
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "Upload failures: %lu\n",
+                        (unsigned long)db_st.total_upload_failures);
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "Upload queue depth: %lu\n",
+                        (unsigned long)db_st.upload_queue_depth);
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "Local cache: %lu / %lu bytes (%d files)\n",
+                        (unsigned long)db_st.local_cache_bytes_used,
+                        (unsigned long)db_st.local_cache_bytes_max, db_st.local_cache_num_files);
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "Replica mode: %s\n",
+                        db_st.replica_mode ? "ON" : "OFF");
+    }
 
     /* Last conflict info */
     mysql_mutex_lock(&last_conflict_mutex);
@@ -1457,6 +1606,56 @@ static int tidesdb_init_func(void *p)
     cfg.unified_memtable_sync_interval_us = (uint64_t)srv_unified_memtable_sync_interval;
     cfg.unified_memtable_skip_list_max_level = 0;      /* 0 = library default */
     cfg.unified_memtable_skip_list_probability = 0.0f; /* 0 = library default */
+
+    /* Object store connector setup */
+    tidesdb_objstore_t *objstore_connector = NULL;
+    tidesdb_objstore_config_t objstore_cfg;
+
+    if (srv_object_store_backend == 1) /* S3 */
+    {
+#ifdef TIDESDB_WITH_S3
+        if (!srv_s3_endpoint || !srv_s3_bucket || !srv_s3_access_key || !srv_s3_secret_key)
+        {
+            sql_print_error(
+                "TIDESDB: S3 backend requires s3_endpoint, s3_bucket, "
+                "s3_access_key, and s3_secret_key");
+            DBUG_RETURN(1);
+        }
+
+        objstore_connector = tidesdb_objstore_s3_create(
+            srv_s3_endpoint, srv_s3_bucket, srv_s3_prefix, srv_s3_access_key, srv_s3_secret_key,
+            srv_s3_region, srv_s3_use_ssl ? 1 : 0, srv_s3_path_style ? 1 : 0);
+
+        if (!objstore_connector)
+        {
+            sql_print_error("TIDESDB: Failed to create S3 connector for %s/%s", srv_s3_endpoint,
+                            srv_s3_bucket);
+            DBUG_RETURN(1);
+        }
+
+        sql_print_information("TIDESDB: S3 connector created (endpoint=%s, bucket=%s, ssl=%s)",
+                              srv_s3_endpoint, srv_s3_bucket, srv_s3_use_ssl ? "yes" : "no");
+#else
+        sql_print_error(
+            "TIDESDB: S3 backend requested but TidesDB was not built with "
+            "-DTIDESDB_WITH_S3=ON");
+        DBUG_RETURN(1);
+#endif
+    }
+
+    if (objstore_connector)
+    {
+        objstore_cfg = tidesdb_objstore_default_config();
+        objstore_cfg.local_cache_max_bytes = (size_t)srv_objstore_local_cache_max;
+        objstore_cfg.wal_sync_threshold_bytes = (size_t)srv_objstore_wal_sync_threshold;
+        objstore_cfg.wal_sync_on_commit = srv_objstore_wal_sync_on_commit ? 1 : 0;
+        objstore_cfg.replica_mode = srv_replica_mode ? 1 : 0;
+        objstore_cfg.replica_sync_interval_us = (uint64_t)srv_replica_sync_interval;
+        objstore_cfg.replica_replay_wal = 1;
+
+        cfg.object_store = objstore_connector;
+        cfg.object_store_config = &objstore_cfg;
+    }
 
     int rc = tidesdb_open(&cfg, &tdb_global);
     if (rc != TDB_SUCCESS)
@@ -2718,7 +2917,10 @@ int ha_tidesdb::iter_read_current(uchar *buf)
     {
         uint8_t *key = NULL;
         size_t key_size = 0;
-        if (tidesdb_iter_key(scan_iter, &key, &key_size) != TDB_SUCCESS) return HA_ERR_END_OF_FILE;
+        uint8_t *value = NULL;
+        size_t value_size = 0;
+        if (tidesdb_iter_key_value(scan_iter, &key, &key_size, &value, &value_size) != TDB_SUCCESS)
+            return HA_ERR_END_OF_FILE;
 
         /* We skip non-data keys (meta namespace) */
         if (!is_data_key(key, key_size))
@@ -2731,14 +2933,8 @@ int ha_tidesdb::iter_read_current(uchar *buf)
         current_pk_len_ = (uint)(key_size - 1);
         memcpy(current_pk_buf_, key + 1, current_pk_len_);
 
-        uint8_t *value = NULL;
-        size_t value_size = 0;
-        if (tidesdb_iter_value(scan_iter, &value, &value_size) != TDB_SUCCESS)
-            return HA_ERR_END_OF_FILE;
-
         if (!share->has_blobs && !share->encrypted)
         {
-            /* We just unpack directly from iterator buffer (no copy) */
             deserialize_row(buf, (const uchar *)value, value_size);
         }
         else
@@ -3074,6 +3270,7 @@ int ha_tidesdb::rnd_init(bool scan)
     DBUG_ENTER("ha_tidesdb::rnd_init");
 
     current_pk_len_ = 0;
+    scan_dir_ = DIR_NONE;
 
     /* Lazy txn -- we ensure stmt_txn exists */
     {
@@ -3131,11 +3328,13 @@ int ha_tidesdb::rnd_next(uchar *buf)
 {
     DBUG_ENTER("ha_tidesdb::rnd_next");
 
+    /* advance past the last-read entry.  on the first call after rnd_init
+     * the iterator is already positioned at the first data key by the seek
+     * in rnd_init, so we skip the advance (scan_dir_ == DIR_NONE). */
+    if (scan_dir_ != DIR_NONE) tidesdb_iter_next(scan_iter);
+
     int ret = iter_read_current(buf);
-    if (ret == 0)
-    {
-        tidesdb_iter_next(scan_iter);
-    }
+    if (ret == 0) scan_dir_ = DIR_FORWARD;
 
     DBUG_RETURN(ret);
 }
@@ -3323,11 +3522,7 @@ int ha_tidesdb::index_read_map(uchar *buf, const uchar *key, key_part_map keypar
             }
             tidesdb_iter_seek(scan_iter, seek_key, seek_len);
             int ret = iter_read_current(buf);
-            if (ret == 0)
-            {
-                tidesdb_iter_next(scan_iter);
-                scan_dir_ = DIR_FORWARD;
-            }
+            if (ret == 0) scan_dir_ = DIR_FORWARD;
             DBUG_RETURN(ret);
         }
 
@@ -3352,11 +3547,7 @@ int ha_tidesdb::index_read_map(uchar *buf, const uchar *key, key_part_map keypar
             }
 
             int ret = iter_read_current(buf);
-            if (ret == 0)
-            {
-                tidesdb_iter_next(scan_iter);
-                scan_dir_ = DIR_FORWARD;
-            }
+            if (ret == 0) scan_dir_ = DIR_FORWARD;
             DBUG_RETURN(ret);
         }
         else if (find_flag == HA_READ_KEY_OR_PREV || find_flag == HA_READ_BEFORE_KEY ||
@@ -3380,11 +3571,7 @@ int ha_tidesdb::index_read_map(uchar *buf, const uchar *key, key_part_map keypar
         /* Fallback is to seek forward */
         tidesdb_iter_seek(scan_iter, seek_key, seek_len);
         int ret = iter_read_current(buf);
-        if (ret == 0)
-        {
-            tidesdb_iter_next(scan_iter);
-            scan_dir_ = DIR_FORWARD;
-        }
+        if (ret == 0) scan_dir_ = DIR_FORWARD;
         DBUG_RETURN(ret);
     }
     else
@@ -3474,17 +3661,8 @@ int ha_tidesdb::index_read_map(uchar *buf, const uchar *key, key_part_map keypar
                 ret = fetch_row_by_pk(scan_txn, ik + idx_col_len, (uint)(iks - idx_col_len), buf);
             if (ret == 0)
             {
-                if (is_backward)
-                {
-                    scan_dir_ = DIR_BACKWARD;
-                }
-                else
-                {
-                    tidesdb_iter_next(scan_iter);
-                    scan_dir_ = DIR_FORWARD;
-                }
+                scan_dir_ = is_backward ? DIR_BACKWARD : DIR_FORWARD;
             }
-
             DBUG_RETURN(ret);
         }
     }
@@ -3505,21 +3683,22 @@ int ha_tidesdb::index_next(uchar *buf)
         uint seek_len = build_data_key(current_pk_buf_, current_pk_len_, seek_key);
         tidesdb_iter_seek(scan_iter, seek_key, seek_len);
         if (tidesdb_iter_valid(scan_iter)) tidesdb_iter_next(scan_iter);
-        /* Iterator is now one ahead -- matches DIR_FORWARD contract */
+        /* iterator is now past the PK exact match -- advance+read below */
     }
     else
     {
         int irc = ensure_scan_iter();
         if (irc) DBUG_RETURN(irc);
-        /* Direction switch -- if last op was backward, iterator is at the
-           last-read row.  We skip past it so we read the next one. */
-        if (scan_dir_ == DIR_BACKWARD) tidesdb_iter_next(scan_iter);
+        /* advance past the last-read entry (iterator stays at current
+         * with no pre-advance).  On the first call after index_first
+         * sets DIR_NONE, the iterator is already at the correct position
+         * so we must not advance. */
+        if (scan_dir_ != DIR_NONE) tidesdb_iter_next(scan_iter);
     }
 
     if (is_pk)
     {
         int ret = iter_read_current(buf);
-        if (ret == 0) tidesdb_iter_next(scan_iter);
         scan_dir_ = DIR_FORWARD;
         DBUG_RETURN(ret);
     }
@@ -3554,7 +3733,6 @@ int ha_tidesdb::index_next(uchar *buf)
                 ret = 0;
             else
                 ret = fetch_row_by_pk(scan_txn, ik + idx_key_len, (uint)(iks - idx_key_len), buf);
-            if (ret == 0) tidesdb_iter_next(scan_iter);
             scan_dir_ = DIR_FORWARD;
             DBUG_RETURN(ret);
         }
@@ -3575,15 +3753,15 @@ int ha_tidesdb::index_prev(uchar *buf)
         uchar seek_key[MAX_KEY_LENGTH + 2];
         uint seek_len = build_data_key(current_pk_buf_, current_pk_len_, seek_key);
         tidesdb_iter_seek(scan_iter, seek_key, seek_len);
-        /* Iterator is at the matched key -- fall through to prev() */
+        /* iterator is at the matched key -- fall through to prev() */
     }
     else
     {
         int irc = ensure_scan_iter();
         if (irc) DBUG_RETURN(irc);
-        if (scan_dir_ == DIR_FORWARD) tidesdb_iter_prev(scan_iter);
     }
 
+    /* advance backward past the last-read entry */
     tidesdb_iter_prev(scan_iter);
 
     bool is_pk = share->has_user_pk && active_index == share->pk_index;
@@ -3653,11 +3831,7 @@ int ha_tidesdb::index_first(uchar *buf)
         uint8_t data_prefix = KEY_NS_DATA;
         tidesdb_iter_seek(scan_iter, &data_prefix, 1);
         int ret = iter_read_current(buf);
-        if (ret == 0)
-        {
-            tidesdb_iter_next(scan_iter);
-            scan_dir_ = DIR_FORWARD;
-        }
+        if (ret == 0) scan_dir_ = DIR_FORWARD;
         DBUG_RETURN(ret);
     }
     else
@@ -3728,7 +3902,11 @@ int ha_tidesdb::index_next_same(uchar *buf, const uchar *key, uint keylen)
 
         /* Partial PK prefix on a composite PK -- iterate through data keys
            that share this prefix-- KEY_NS_DATA + comparable_pk_prefix... */
-        if (!scan_iter || !tidesdb_iter_valid(scan_iter)) DBUG_RETURN(HA_ERR_END_OF_FILE);
+        if (!scan_iter) DBUG_RETURN(HA_ERR_END_OF_FILE);
+
+        /* advance past the last-read entry */
+        tidesdb_iter_next(scan_iter);
+        if (!tidesdb_iter_valid(scan_iter)) DBUG_RETURN(HA_ERR_END_OF_FILE);
 
         uint8_t *ik = NULL;
         size_t iks = 0;
@@ -3741,20 +3919,18 @@ int ha_tidesdb::index_next_same(uchar *buf, const uchar *key, uint keylen)
             DBUG_RETURN(HA_ERR_END_OF_FILE);
 
         int ret = iter_read_current(buf);
-        if (ret == 0)
-        {
-            tidesdb_iter_next(scan_iter);
-            scan_dir_ = DIR_FORWARD;
-        }
+        if (ret == 0) scan_dir_ = DIR_FORWARD;
         DBUG_RETURN(ret);
     }
 
-    /* Secondary index -- ICP loop -- we skip entries that fail the pushed
-       condition without the expensive PK point-lookup. */
+    /* Secondary index -- advance past the last-read entry, then ICP loop */
+    if (!scan_iter) DBUG_RETURN(HA_ERR_END_OF_FILE);
+    tidesdb_iter_next(scan_iter);
+
     uint idx_col_len = share->idx_comp_key_len[active_index];
     for (;;)
     {
-        if (!scan_iter || !tidesdb_iter_valid(scan_iter)) DBUG_RETURN(HA_ERR_END_OF_FILE);
+        if (!tidesdb_iter_valid(scan_iter)) DBUG_RETURN(HA_ERR_END_OF_FILE);
 
         uint8_t *ik = NULL;
         size_t iks = 0;
@@ -3782,7 +3958,6 @@ int ha_tidesdb::index_next_same(uchar *buf, const uchar *key, uint keylen)
             ret = 0;
         else
             ret = fetch_row_by_pk(scan_txn, ik + idx_col_len, (uint)(iks - idx_col_len), buf);
-        if (ret == 0) tidesdb_iter_next(scan_iter);
         DBUG_RETURN(ret);
     }
 }
@@ -5632,8 +5807,8 @@ maria_declare_plugin(tidesdb){
     PLUGIN_LICENSE_GPL,
     tidesdb_init_func,
     tidesdb_deinit_func,
-    0x40001,
+    0x40100,
     NULL,
     tidesdb_system_variables,
-    "4.0.1",
+    "4.1.0",
     MariaDB_PLUGIN_MATURITY_GAMMA} maria_declare_plugin_end;

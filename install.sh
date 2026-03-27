@@ -52,6 +52,7 @@
 #   --list-engines              List storage engines that can be skipped and exit
 #   --rebuild-plugin             Rebuild only the TidesDB plugin (fast dev cycle)
 #   --pgo                       Enable Profile-Guided Optimization (3-phase build)
+#   --s3                        Build TidesDB with S3 object store connector (requires libcurl + OpenSSL)
 #   --help                      Show this help message
 #
 # Platform defaults:
@@ -167,6 +168,7 @@ SKIP_TIDESDB=false
 REBUILD_PLUGIN=false
 PGO_ENABLED=false
 SKIP_ENGINES=""
+WITH_S3=false
 
 # ── Ensure VCPKG_ROOT is set on Windows (needed even with --skip-deps) ────────
 if [[ "$OS" == "windows" ]]; then
@@ -246,6 +248,7 @@ while [[ $# -gt 0 ]]; do
         --skip-engines)     SKIP_ENGINES="$2";      shift 2 ;;
         --list-engines)     list_engines ;;
         --pgo)              PGO_ENABLED=true;       shift   ;;
+        --s3)               WITH_S3=true;           shift   ;;
         --help|-h)          usage ;;
         *) die "Unknown option: $1 (try --help)" ;;
     esac
@@ -471,6 +474,11 @@ build_tidesdb() {
         -DBUILD_SHARED_LIBS=ON
     )
 
+    if $WITH_S3; then
+        cmake_args+=(-DTIDESDB_WITH_S3=ON)
+        info "S3 object store connector enabled"
+    fi
+
     case "$OS" in
         macos)
             local sdk_root
@@ -550,6 +558,11 @@ build_mariadb() {
         -DWITH_MARIABACKUP=ON
         -DWITH_UNIT_TESTS=OFF
     )
+
+    # S3 object store connector for the plugin
+    if $WITH_S3; then
+        cmake_args+=(-DTIDESDB_WITH_S3=ON)
+    fi
 
     # Disable skipped engines
     if [[ -n "$SKIP_ENGINES" ]]; then
