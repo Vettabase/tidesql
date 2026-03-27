@@ -1,4 +1,5 @@
 *.d
+!docker/initdb.d/
 *.Plo
 *.Po
 .deps/
