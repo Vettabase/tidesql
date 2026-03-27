@@ -1,0 +1,5 @@
+# Ignore all init scripts except the example and the keep file.
+*
+!.gitignore
+!.keep
+!00-example.sql
