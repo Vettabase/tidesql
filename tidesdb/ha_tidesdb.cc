@@ -129,7 +129,9 @@ static handlerton *tidesdb_hton;
 */
 
 /* Number of hash partitions for the row lock table.
-   Configured via tidesdb_row_lock_stripes sysvar (default 1024). */
+   65536 partitions (~512 KB overhead) virtually eliminates false contention
+   between unrelated rows while keeping memory usage negligible. */
+static constexpr ulong ROW_LOCK_PARTITIONS = 65536;
 
 /* Row lock entry in the hash table */
 struct tdb_row_lock_t
@@ -153,12 +155,11 @@ struct tdb_lock_partition_t
 };
 
 static tdb_lock_partition_t *lock_partitions = NULL;
-static ulong srv_row_lock_stripes = 1024;
 
 static inline uint tdb_lock_part(const uchar *key, uint len)
 {
     uint64_t h = XXH3_64bits(key, len);
-    return (uint)(h % srv_row_lock_stripes);
+    return (uint)(h % ROW_LOCK_PARTITIONS);
 }
 
 /* Find or create a lock entry in the partition's hash chain.
@@ -470,22 +471,19 @@ static MYSQL_SYSVAR_BOOL(print_all_conflicts, srv_print_all_conflicts, PLUGIN_VA
                          NULL, NULL, 0);
 
 static MYSQL_SYSVAR_BOOL(pessimistic_locking, srv_pessimistic_locking, PLUGIN_VAR_RQCMDARG,
-                         "Enable plugin-level row locks for UPDATE/DELETE. "
+                         "Enable plugin-level row locks for SELECT ... FOR UPDATE, "
+                         "UPDATE, DELETE, and INSERT on user-defined primary keys. "
                          "OFF (default): pure optimistic MVCC -- concurrent writers on the "
                          "same row are detected at COMMIT time (TDB_ERR_CONFLICT). "
-                         "ON: writers acquire a striped mutex per PK hash, serializing "
-                         "concurrent access to the same row like InnoDB's row locks. "
-                         "Enable for TPC-C or legacy workloads that depend on "
-                         "SELECT ... FOR UPDATE semantics",
+                         "ON: all write-intent statements acquire per-row locks via a "
+                         "partitioned hash-table lock manager with wait-for-graph "
+                         "deadlock detection. Locks are held until COMMIT or ROLLBACK. "
+                         "Both explicit transactions and autocommit statements participate. "
+                         "Locks can be acquired on non-existing PK values (e.g. SELECT "
+                         "... FOR UPDATE on a missing row blocks INSERT of that key). "
+                         "Enable for TPC-C or workloads that depend on row-level "
+                         "serialization semantics",
                          NULL, NULL, 0);
-
-static MYSQL_SYSVAR_ULONG(row_lock_stripes, srv_row_lock_stripes,
-                          PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_READONLY,
-                          "Number of striped mutexes for pessimistic row locking. "
-                          "Higher values reduce false contention between unrelated rows "
-                          "at the cost of memory. Only meaningful when "
-                          "tidesdb_pessimistic_locking=ON",
-                          NULL, NULL, 1024, 64, 65536, 0);
 
 static MYSQL_SYSVAR_ULONGLONG(block_cache_size, srv_block_cache_size,
                               PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_READONLY,
@@ -747,7 +745,7 @@ static MYSQL_SYSVAR_STR(backup_dir, srv_backup_dir, PLUGIN_VAR_RQCMDARG | PLUGIN
                         "Example: SET GLOBAL tidesdb_backup_dir = '/path/to/backup'",
                         NULL, tidesdb_backup_dir_update, NULL);
 
-/* ---- Checkpoint (hard-link snapshot) via system variable ---- */
+/* Checkpoint (hard-link snapshot) via system variable */
 
 static char *srv_checkpoint_dir = NULL;
 
@@ -803,7 +801,6 @@ static struct st_mysql_sys_var *tidesdb_system_variables[] = {
     MYSQL_SYSVAR(checkpoint_dir),
     MYSQL_SYSVAR(print_all_conflicts),
     MYSQL_SYSVAR(pessimistic_locking),
-    MYSQL_SYSVAR(row_lock_stripes),
     MYSQL_SYSVAR(data_home_dir),
     MYSQL_SYSVAR(ttl),
     MYSQL_SYSVAR(skip_unique_check),
@@ -962,7 +959,7 @@ static inline bool is_data_key(const uint8_t *key, size_t key_size)
     return key_size > 0 && key[0] == KEY_NS_DATA;
 }
 
-/* ----- Shared enum-to-constant maps (used by create, open, prepare_inplace) ----- */
+/* Shared enum-to-constant maps (used by create, open, prepare_inplace) */
 
 static const int tdb_compression_map[] = {TDB_COMPRESS_NONE, TDB_COMPRESS_SNAPPY, TDB_COMPRESS_LZ4,
                                           TDB_COMPRESS_ZSTD, TDB_COMPRESS_LZ4_FAST};
@@ -1557,11 +1554,10 @@ static int tidesdb_init_func(void *p)
     /* Initialize partitioned lock table for pessimistic row locking.
        Partition count comes from tidesdb_row_lock_stripes sysvar. */
     lock_partitions = (tdb_lock_partition_t *)my_malloc(
-        PSI_NOT_INSTRUMENTED, srv_row_lock_stripes * sizeof(tdb_lock_partition_t),
-        MYF(MY_ZEROFILL));
+        PSI_NOT_INSTRUMENTED, ROW_LOCK_PARTITIONS * sizeof(tdb_lock_partition_t), MYF(MY_ZEROFILL));
     if (lock_partitions)
     {
-        for (ulong i = 0; i < srv_row_lock_stripes; i++)
+        for (ulong i = 0; i < ROW_LOCK_PARTITIONS; i++)
         {
             mysql_mutex_init(0, &lock_partitions[i].mutex, MY_MUTEX_INIT_FAST);
             lock_partitions[i].chain = NULL;
@@ -1682,7 +1678,7 @@ static int tidesdb_deinit_func(void *p)
     mysql_mutex_destroy(&last_conflict_mutex);
     if (lock_partitions)
     {
-        for (ulong i = 0; i < srv_row_lock_stripes; i++)
+        for (ulong i = 0; i < ROW_LOCK_PARTITIONS; i++)
         {
             /* Free all lock entries in the hash chain */
             tdb_row_lock_t *e = lock_partitions[i].chain;
@@ -3034,6 +3030,22 @@ int ha_tidesdb::write_row(const uchar *buf)
         trx->stmt_was_dirty = true;
     }
 
+    /* Acquire pessimistic row lock for INSERT when pessimistic_locking=ON.
+       Without this, INSERT bypasses locks held by SELECT ... FOR UPDATE,
+       UPDATE, and DELETE on the same PK -- breaking the serialization
+       guarantee that pessimistic locking is supposed to provide.
+       We use the comparable PK bytes (pk, pk_len) which are the same key
+       format used by index_read_map() for lock acquisition. */
+    if (unlikely(srv_pessimistic_locking) && share->has_user_pk && trx)
+    {
+        int lrc = row_lock_acquire(trx, pk, pk_len);
+        if (lrc)
+        {
+            tmp_restore_column_map(&table->read_set, old_map);
+            DBUG_RETURN(lrc);
+        }
+    }
+
     /* Cache THDVAR lookups once per statement. */
     if (!cached_thdvars_valid_)
     {
@@ -3982,10 +3994,10 @@ int ha_tidesdb::update_row(const uchar *old_data, const uchar *new_data)
     uint old_pk_len = current_pk_len_;
     memcpy(old_pk, current_pk_buf_, old_pk_len);
 
-    /* Row locks are acquired in index_read_map() for SELECT ... FOR UPDATE.
-       No need to acquire here - the row is already locked from the preceding
-       locking read.  For plain UPDATE without FOR UPDATE, the operation is
-       atomic (single autocommit statement) and no lock is needed. */
+    /* Row locks are acquired in index_read_map() during the preceding
+       locking read (SELECT ... FOR UPDATE, UPDATE, DELETE all go through
+       index_read_map with write intent).  No need to acquire here - the
+       row is already locked. */
 
     /* new_pk uses its own stack buffer so it survives the current_pk_buf_
        manipulations in the secondary index loop (avoids overlapping memcpy UB) */
@@ -4110,8 +4122,8 @@ int ha_tidesdb::delete_row(const uchar *buf)
     /* Use cached_trx_ from external_lock to avoid per-row hash lookups. */
     tidesdb_trx_t *trx = cached_trx_;
 
-    /* Row locks are acquired in index_read_map() for SELECT ... FOR UPDATE.
-       No need to acquire here - see update_row() comment. */
+    /* Row locks are acquired in index_read_map() during the preceding
+       locking read - see update_row() comment. */
 
     {
         int erc = ensure_stmt_txn();
@@ -5807,8 +5819,8 @@ maria_declare_plugin(tidesdb){
     PLUGIN_LICENSE_GPL,
     tidesdb_init_func,
     tidesdb_deinit_func,
-    0x40100,
+    0x40101,
     NULL,
     tidesdb_system_variables,
-    "4.1.0",
+    "4.1.1",
     MariaDB_PLUGIN_MATURITY_GAMMA} maria_declare_plugin_end;
