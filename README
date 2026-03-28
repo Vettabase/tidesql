@@ -213,7 +213,8 @@ Core:
 - START TRANSACTION WITH CONSISTENT SNAPSHOT
 - Lock-free concurrency (no THR_LOCK, TidesDB handles isolation internally)
 - Optional pessimistic row locking (tidesdb_pessimistic_locking=ON) for
-  workloads that depend on SELECT ... FOR UPDATE serialization (e.g. TPC-C)
+  workloads that depend on row-level serialization (e.g. TPC-C).
+  Locks are acquired by SELECT ... FOR UPDATE, UPDATE, DELETE, and INSERT
 - LSM-tree storage with optional B+tree SSTable format
 - Compression (NONE, LZ4, LZ4_FAST, ZSTD, Snappy)
 - Bloom filters for fast key lookups
@@ -273,7 +274,6 @@ Read-only (set at startup):
   unified_memtable_write_buffer_size  Write buffer for unified memtable (default: 128MB)
   unified_memtable_sync_mode         NONE/INTERVAL/FULL for unified WAL (default: FULL)
   unified_memtable_sync_interval     Sync interval in µs for INTERVAL mode (default: 128000)
-  row_lock_stripes          Legacy compat; lock table uses 256 hash partitions
   object_store_backend      LOCAL or S3 (default: LOCAL)
   s3_endpoint               S3 endpoint (e.g. s3.amazonaws.com)
   s3_bucket                 S3 bucket name
@@ -294,12 +294,13 @@ Dynamic (SET GLOBAL at runtime):
   backup_dir                Set to a path to trigger online backup
   checkpoint_dir            Set to a path to trigger hard-link checkpoint
   print_all_conflicts       Log all TDB_ERR_CONFLICT events (default: OFF)
-  pessimistic_locking       Enable plugin-level row locks for SELECT...FOR UPDATE
-                            in multi-statement transactions (default: OFF).
-                            Uses a partitioned hash-table lock manager with
-                            per-row granularity and wait-for-graph deadlock
-                            detection. Enable for TPC-C or workloads needing
-                            FOR UPDATE serialization semantics.
+  pessimistic_locking       Enable plugin-level row locks for SELECT...FOR UPDATE,
+                            UPDATE, DELETE, and INSERT (default: OFF). All
+                            write-intent statements acquire per-row locks,
+                            including autocommit. Uses a partitioned hash-table
+                            lock manager with wait-for-graph deadlock detection.
+                            Locks can cover non-existing PK values. Enable for
+                            TPC-C or workloads needing row-level serialization.
   promote_primary           Set to ON to promote a replica to primary
                             (trigger variable, resets to OFF after promotion)
 
@@ -394,7 +395,7 @@ Run specific test:
 
   perl mtr --suite=tidesdb tidesdb_crud
 
-Available tests (30 total):
+Available tests (32 total):
   tidesdb_alter_crash         Crash safety during ALTER TABLE operations
   tidesdb_analyze             ANALYZE TABLE with CF statistics output
   tidesdb_backup              Online backup via tidesdb_backup_dir
@@ -415,6 +416,8 @@ Available tests (30 total):
   tidesdb_options             Table and field options
   tidesdb_partition           RANGE/LIST/HASH/KEY partitioning
   tidesdb_per_index_btree     Per-index USE_BTREE option
+  tidesdb_pessimistic_forupdate    SELECT FOR UPDATE serialization (pessimistic locking)
+  tidesdb_pessimistic_insert_lock  Pessimistic locking edge cases (non-existing rows, INSERT)
   tidesdb_pk_index            Primary key and secondary index scans
   tidesdb_rename              Table rename
   tidesdb_replace_iodku       REPLACE INTO and INSERT ON DUPLICATE KEY UPDATE
@@ -424,7 +427,7 @@ Available tests (30 total):
   tidesdb_tpcc_contention     TPC-C district counter contention (pessimistic locking)
   tidesdb_ttl                 Time-to-live expiration
   tidesdb_vcol                Virtual/generated columns
-  tidesdb_write_pressure      oltp_write_only pressure (multi-connection)
+  tidesdb_write_pressure          oltp_write_only pressure (multi-connection)
 
 Run with verbose output:
 

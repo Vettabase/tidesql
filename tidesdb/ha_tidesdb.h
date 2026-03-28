@@ -33,51 +33,51 @@ extern "C"
 #include <tidesdb/db.h>
 }
 
-/* ----- Key namespace prefixes (first byte of every TidesDB key) ------------------------------- */
+/* Key namespace prefixes (first byte of every TidesDB key) */
 static constexpr uint8_t KEY_NS_META = 0x00;
 static constexpr uint8_t KEY_NS_DATA = 0x01;
 
-/* ----- CF naming ------------------------------------------------------------------------------ */
+/* CF naming */
 static constexpr const char CF_INDEX_INFIX[] = "__idx_";
 
-/* ----- Hidden primary key size (tables without explicit PK) ----------------------------------- */
+/* Hidden primary key size (tables without explicit PK) */
 static constexpr size_t HIDDEN_PK_SIZE = sizeof(uint64_t);
 
-/* ----- Maximum number of secondary indexes we support ----------------------------------------- */
+/* Maximum number of secondary indexes we support */
 static constexpr uint MAX_TIDESDB_KEYS = MAX_KEY;
 
-/* ----- Cost model constants for the optimizer ------------------------------------------------- */
+/* Cost model constants for the optimizer */
 static constexpr double TIDESDB_COST_SEQ_READ = 0.00005;
 static constexpr double TIDESDB_COST_KEY_READ = 0.00003;
 static constexpr double TIDESDB_COST_RANGE_SETUP = 0.0001;
 static constexpr double TIDESDB_DEFAULT_READ_AMP = 1.0;
 
-/* ----- Stats cache refresh interval (microseconds) -------------------------------------------- */
+/* Stats cache refresh interval (microseconds) */
 static constexpr long long TIDESDB_STATS_REFRESH_US = 2000000LL; /* 2 seconds */
 
-/* ----- Minimum stats.records to avoid optimizer edge cases with 0 rows ------------------------ */
+/* Minimum stats.records to avoid optimizer edge cases with 0 rows */
 static constexpr ha_rows TIDESDB_MIN_STATS_RECORDS = 2;
 
-/* ----- Inplace index build batch commit size -------------------------------------------------- */
+/* Inplace index build batch commit size */
 static constexpr ha_rows TIDESDB_INDEX_BUILD_BATCH = 10000;
 
-/* ----- Bulk insert mid-txn commit threshold (ops, not rows) ----------------------------------- */
+/* Bulk insert mid-txn commit threshold (ops, not rows) */
 static constexpr ha_rows TIDESDB_BULK_INSERT_BATCH_OPS = 50000;
 
-/* ----- Encryption ----------------------------------------------------------------------------- */
+/* Encryption */
 static constexpr uint TIDESDB_ENC_IV_LEN = 16;
 static constexpr uint TIDESDB_ENC_KEY_LEN = 32;
 
-/* ----- Bloom filter FPR conversion (table option stores parts per 10000) ---------------------- */
+/* Bloom filter FPR conversion (table option stores parts per 10000) */
 static constexpr double TIDESDB_BLOOM_FPR_DIVISOR = 10000.0;
 
-/* ----- Skip list probability conversion (table option stores percentage) ---------------------- */
+/* Skip list probability conversion (table option stores percentage) */
 static constexpr float TIDESDB_SKIP_LIST_PROB_DIV = 100.0f;
 
-/* ----- TTL sentinel value meaning no expiration ----------------------------------------------- */
+/* TTL sentinel value meaning no expiration */
 static constexpr time_t TIDESDB_TTL_NONE = (time_t)-1;
 
-/* ----- Default block cache size (bytes) ------------------------------------------------------- */
+/* Default block cache size (bytes) */
 static constexpr ulonglong TIDESDB_DEFAULT_BLOCK_CACHE = 256ULL * 1024 * 1024; /* 256M */
 
 /*
@@ -292,7 +292,7 @@ class ha_tidesdb : public handler
     bool keyread_only_;
     bool write_can_replace_; /* true during REPLACE INTO (HA_EXTRA_WRITE_CAN_REPLACE) */
 
-    /* ----- private helpers ----------------------------------------------------------------------
+    /* private helpers
      */
     int ensure_stmt_txn(); /* lazy txn creation on first data access */
     TidesDB_share *get_share();
