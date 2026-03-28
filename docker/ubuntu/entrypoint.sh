@@ -3,6 +3,7 @@
 #
 # If MARIADB_PREFIX/data/mysql does not exist the data directory is initialised
 # with mariadb-install-db.
+#################################################################################################
 # The server is then started via mariadbd, and any .sql / .sh files found in
 # /docker-entrypoint-initdb.d are executed in alphabetical order once the
 # server is ready.
@@ -45,7 +46,7 @@ if [ ! -d "${DATADIR}/mysql" ]; then
     echo "[entrypoint] Data directory initialised."
 fi
 
-# Start MariaDB ─
+# Start MariaDB
 # Ensure runtime directories exist with correct ownership (handles volume mounts).
 chown -R mysql:mysql /etc/mysql
 mkdir -p "${DATADIR}" "${MARIADB_PREFIX}/log"

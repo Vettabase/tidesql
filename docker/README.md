@@ -185,7 +185,7 @@ include more databases in your image, more users, or drop the `test` database.
 
 To do so, you can use the `/docker-entrypoint-initdb.d` directory, is a volume
 that can be mapped to a local directory. Any `.sql` and `.sh` files placed there
-are executed automatically, in alphabetical order, every time a container starts —
+are executed automatically, in alphabetical order, every time a container starts -
 right after MariaDB is up and ready to accept connections.
 
 This is useful for:
