@@ -1,5 +1,5 @@
 /*
-  Copyright (c) 2026 TidesDB
+  Copyright (c) 2026 TidesDB Corp.
 
   This program is free software; you can redistribute it and/or modify
   it under the terms of the GNU General Public License as published by
@@ -20,6 +20,7 @@
 #include <condition_variable>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -188,8 +189,9 @@ struct tidesdb_trx_t
        and UPDATE/DELETE (update_row/delete_row).  Released on commit/rollback.
        Implements pessimistic row locking with deadlock detection via a global
        lock table (hash table with wait queues and wait-for graph traversal).
-       This emulates InnoDB-style row locks for workloads like TPC-C that
+       This in a way emulates InnoDB-style row locks for workloads like TPC-C that
        require read-modify-write serialization on the same key. */
+
     struct tdb_row_lock_t *held_locks_head; /* singly-linked list of held lock entries */
     uint64_t lock_txn_id; /* unique ID for deadlock detection (= txn_generation) */
     struct tdb_row_lock_t
@@ -222,7 +224,25 @@ class ha_tidesdb : public handler
         DIR_FORWARD,
         DIR_BACKWARD
     } scan_dir_;
-    std::string last_row; /* keeps BLOB data alive across calls */
+    std::string last_row;  /* keeps BLOB data alive for record[0] */
+    std::string last_row2; /* keeps BLOB data alive for record[1] */
+
+    /* Spatial index scan state */
+    bool spatial_scan_active_{false};
+    enum ha_rkey_function spatial_mode_
+    {
+        HA_READ_KEY_EXACT
+    };
+    double spatial_qmbr_[4]{}; /* query MBR: xmin, ymin, xmax, ymax */
+
+    /* Hilbert range decomposition: sorted non-overlapping [lo, hi] ranges
+       covering the query box.  spatial_range_idx_ tracks which range we're
+       currently scanning. */
+    std::vector<std::pair<uint64_t, uint64_t>> spatial_ranges_; /* {lo, hi} */
+    size_t spatial_range_idx_{0};
+
+    /* Spatial scan continuation -- scans Hilbert range with MBR post-filter */
+    int spatial_scan_next(uchar *buf);
 
     /* Current row's PK key bytes (without namespace prefix).
        Fixed buffer eliminates std::string heap allocation per row. */
@@ -299,6 +319,7 @@ class ha_tidesdb : public handler
     const std::string &serialize_row(const uchar *buf);
     void deserialize_row(uchar *buf, const uchar *data, size_t len);
     void deserialize_row(uchar *buf, const std::string &row);
+
     /* Build memcmp-comparable key bytes into out[]; returns byte count */
     uint make_comparable_key(KEY *key_info, const uchar *record, uint num_parts, uchar *out);
 
@@ -373,7 +394,8 @@ class ha_tidesdb : public handler
                HA_FAST_KEY_READ | HA_REC_NOT_IN_SEQ | HA_CAN_SQL_HANDLER |
                HA_REQUIRES_KEY_COLUMNS_FOR_DELETE | HA_PRIMARY_KEY_REQUIRED_FOR_POSITION |
                HA_ONLINE_ANALYZE | HA_CAN_ONLINE_BACKUPS | HA_CONCURRENT_OPTIMIZE |
-               HA_CAN_TABLES_WITHOUT_ROLLBACK;
+               HA_CAN_TABLES_WITHOUT_ROLLBACK | HA_CAN_FULLTEXT | HA_CAN_GEOMETRY |
+               HA_CAN_RTREEKEYS;
     }
 
     ulong index_flags(uint idx, uint part, bool all_parts) const override;
@@ -456,14 +478,20 @@ class ha_tidesdb : public handler
     int delete_row(const uchar *buf) override;
     int delete_all_rows(void) override;
 
-    /* Bulk insert hint (LOAD DATA, multi-row INSERT, sysbench prepare) */
+    /* Full-text search */
+    int ft_init() override;
+    void ft_end() override;
+    FT_INFO *ft_init_ext(uint flags, uint inx, String *key) override;
+    int ft_read(uchar *buf) override;
+
+    /* Bulk insert hint (LOAD DATA, multi-row INSERT) */
     void start_bulk_insert(ha_rows rows, uint flags) override;
     int end_bulk_insert() override;
 
     /* Index Condition Pushdown (ICP) */
     Item *idx_cond_push(uint keyno, Item *idx_cond) override;
 
-    /* AUTO_INCREMENT -- O(1) atomic counter instead of index_last() per INSERT */
+    /* AUTO_INCREMENT -- O(1) atomic counter */
     void get_auto_increment(ulonglong offset, ulonglong increment, ulonglong nb_desired_values,
                             ulonglong *first_value, ulonglong *nb_reserved_values) override;
 

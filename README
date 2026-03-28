@@ -235,6 +235,12 @@ Core:
 - TRUNCATE TABLE as O(1) drop+recreate (instant regardless of table size)
 - ANALYZE TABLE with detailed CF statistics (levels, keys, sizes, cache hit rate)
 - Cached optimizer statistics (refreshed every 2 seconds from TidesDB)
+- Full-text search (FULLTEXT indexes with BM25 ranking, natural language
+  and boolean mode, charset-aware tokenizer, configurable BM25 parameters)
+- Vector search (VECTOR indexes via MariaDB's MHNSW approximate nearest
+  neighbor, Euclidean and cosine distance, INSERT/UPDATE/DELETE support)
+- Spatial indexes (SPATIAL KEY with Hilbert curve encoding on LSM,
+  MBRIntersects/MBRContains/MBRWithin/MBREquals/MBRDisjoint predicates)
 
 Cloud / Object Store:
 - S3-compatible object store backend (AWS S3, MinIO, GCS)
@@ -303,6 +309,10 @@ Dynamic (SET GLOBAL at runtime):
                             TPC-C or workloads needing row-level serialization.
   promote_primary           Set to ON to promote a replica to primary
                             (trigger variable, resets to OFF after promotion)
+  fts_min_word_len          Minimum word length for FTS indexing (default: 3)
+  fts_max_word_len          Maximum word length for FTS indexing (default: 84)
+  fts_bm25_k1               BM25 k1 term-frequency saturation (default: 1.2)
+  fts_bm25_b                BM25 b document-length normalization (default: 0.75)
 
 Session (SET SESSION tidesdb_...):
 
@@ -395,7 +405,7 @@ Run specific test:
 
   perl mtr --suite=tidesdb tidesdb_crud
 
-Available tests (32 total):
+Available tests (35 total, 200+ cases):
   tidesdb_alter_crash         Crash safety during ALTER TABLE operations
   tidesdb_analyze             ANALYZE TABLE with CF statistics output
   tidesdb_backup              Online backup via tidesdb_backup_dir
@@ -407,6 +417,7 @@ Available tests (32 total):
   tidesdb_drop_create         Repeated DROP/CREATE/TRUNCATE cycles
   tidesdb_encryption          Data-at-rest encryption
   tidesdb_engine_status       SHOW ENGINE TIDESDB STATUS
+  tidesdb_fulltext            Full-text search (FULLTEXT indexes, BM25, boolean mode)
   tidesdb_index_stats         Index statistics and optimizer cost model
   tidesdb_info_schema         information_schema integration
   tidesdb_insert_conflict     Duplicate key detection and handling
@@ -422,11 +433,13 @@ Available tests (32 total):
   tidesdb_rename              Table rename
   tidesdb_replace_iodku       REPLACE INTO and INSERT ON DUPLICATE KEY UPDATE
   tidesdb_savepoint           SQL SAVEPOINT / ROLLBACK TO / RELEASE SAVEPOINT
+  tidesdb_spatial             Spatial indexes (Hilbert curve, MBR predicates)
   tidesdb_sql                 40 SQL cases (aggregates, JOINs, subqueries, etc.)
   tidesdb_stress              Concurrent transactions, conflicts, truncate cycles
   tidesdb_tpcc_contention     TPC-C district counter contention (pessimistic locking)
   tidesdb_ttl                 Time-to-live expiration
   tidesdb_vcol                Virtual/generated columns
+  tidesdb_vector              Vector search (MHNSW ANN, INSERT/UPDATE/DELETE)
   tidesdb_write_pressure          oltp_write_only pressure (multi-connection)
 
 Run with verbose output:
