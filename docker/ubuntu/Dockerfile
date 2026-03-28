@@ -99,11 +99,14 @@ RUN useradd -r -s /bin/false -d "${MARIADB_PREFIX}/data" mysql && \
 COPY docker/conf/ /etc/mysql/
 RUN chown -R mysql:mysql /etc/mysql
 
-# ── 7. Install entrypoint ──────────────────────────────────────────────────
+# ── 7. Install entrypoint and init-scripts directory ───────────────────────
 COPY docker/ubuntu/entrypoint.sh /usr/local/bin/tidesql-entrypoint.sh
 RUN chmod +x /usr/local/bin/tidesql-entrypoint.sh
 
+COPY docker/initdb.d/ /docker-entrypoint-initdb.d/
+
 VOLUME /etc/mysql
+VOLUME /docker-entrypoint-initdb.d
 VOLUME ${MARIADB_PREFIX}/data
 VOLUME ${MARIADB_PREFIX}/log
 

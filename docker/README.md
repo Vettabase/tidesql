@@ -163,6 +163,60 @@ COMMIT;
 SELECT * FROM person;
 ```
 
+## Customising the Configuration
+
+Files placed in the `conf/custom` directory are loaded after the main
+`my.cnf`, so any settings they contain override the defaults. This directory
+is mounted as part of the `/etc/mysql` volume.
+
+See `conf/custom/00-example.cfg` for an example that shows how to override
+`sql_mode` and `old_mode`. Copy it to a new file (any name ending in `.cfg`)
+in the same directory and edit as needed.
+
+Files added to `conf/custom` (other than `00-example.cfg`) are not versioned
+and will not appear in git.
+
+
+## Initialising Databases and Creating Users
+
+By default, the `root` user needs to authenticate locally via the `UNIX_SOCKET`
+plugin and only the `test` database exists. In practice, you might want to
+include more databases in your image, more users, or drop the `test` database.
+
+To do so, you can use the `/docker-entrypoint-initdb.d` directory, is a volume
+that can be mapped to a local directory. Any `.sql` and `.sh` files placed there
+are executed automatically, in alphabetical order, every time a container starts —
+right after MariaDB is up and ready to accept connections.
+
+This is useful for:
+
+- Creating more users, or being more flexible about how `root` can connect.
+- Creating databases needed by your application.
+- Restoring a backup: place a dump file (e.g. `01-restore.sql`) in the
+  directory so that it is imported when a newly created container starts.
+  Remove the file (or unmap the volume) after the first start to avoid
+  re-running it on subsequent restarts.
+
+See `initdb.d/00-example.sql` for an annotated example. Copy it to a new file
+in the same directory and edit as needed.
+
+Files added to `initdb.d` (other than `00-example.sql`, which does nothinbg) are
+ignored by git.
+
+To map the directory to a local path when running a container:
+
+```
+docker run -d \
+    --name tidesql \
+    -p 3306:3306 \
+    -v tidesql-conf:/etc/mysql \
+    -v tidesql-data:/usr/local/mariadb/data \
+    -v tidesql-log:/usr/local/mariadb/log \
+    -v /path/to/your/initdb.d:/docker-entrypoint-initdb.d \
+    tidesql:latest
+```
+
+
 ## Stopping and Removing the Container
 
 ```
