@@ -1389,7 +1389,7 @@ static ulong srv_object_store_backend = 0;
 static const char *object_store_backend_names[] = {"LOCAL", "S3", NullS};
 static TYPELIB object_store_backend_typelib = {array_elements(object_store_backend_names) - 1,
                                                "object_store_backend_typelib",
-                                               object_store_backend_names, NULL};
+                                               object_store_backend_names, NULL, NULL};
 static MYSQL_SYSVAR_ENUM(object_store_backend, srv_object_store_backend,
                          PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_READONLY,
                          "Object store backend (LOCAL=disabled, S3=S3-compatible)", NULL, NULL, 0,
@@ -6250,19 +6250,13 @@ FT_INFO *ha_tidesdb::ft_init_ext(uint flags, uint inx, String *key)
     {
         if (qt.yesno > 0) num_required++;
 
-        /* We build prefix key-- [2-byte term_len][term bytes] */
-        uchar prefix[2 + 512];
+        /* We build prefix key: [2-byte term_len][term bytes] */
+        uchar prefix[2 + FTS_MAX_TERM_BYTES];
         uint prefix_len = 0;
-        uint term_prefix_len = qt.trunc ? (uint)qt.term.size() : (uint)qt.term.size();
         int2store(prefix, (uint16)qt.term.size());
         prefix_len += 2;
         memcpy(prefix + prefix_len, qt.term.data(), qt.term.size());
         prefix_len += (uint)qt.term.size();
-
-        /* For truncated (wildcard) terms, we only match the prefix portion
-           of the key, so we use a shorter prefix_len for comparison.
-           For exact terms, the full [len][term] must match. */
-        uint match_len = qt.trunc ? (2 + (uint)qt.term.size()) : prefix_len;
 
         /* We scan postings for this term */
         struct posting_entry
@@ -6309,7 +6303,7 @@ FT_INFO *ha_tidesdb::ft_init_ext(uint flags, uint inx, String *key)
                     if (stored_len != tlen) break;
 
                     /* We verify prefix match */
-                    if (iks < 2 + stored_len) break;
+                    if (iks < (size_t)(2 + stored_len)) break;
                     if (memcmp(ik + 2, qt.term.data(), qt.term.size()) != 0) break;
 
                     /* We extract PK and value */
