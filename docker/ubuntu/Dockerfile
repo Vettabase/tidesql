@@ -11,6 +11,8 @@ ARG WITH_TESTS=0
 # Comma-separated list of optional storage engines to disable at compile time.
 # Managed automatically by docker/rebuild.sh via EXCLUDE_ENGINES / INCLUDE_ENGINES.
 ARG DISABLED_ENGINES=""
+# Set WITH_S3=1 to build with S3-compatible object store support (requires libcurl + OpenSSL).
+ARG WITH_S3=0
 
 # Persist key paths as environment variables so they are available in every
 # RUN step and at container runtime.
@@ -34,8 +36,10 @@ RUN apt-get update -qq && \
 COPY tidesdb                        /opt/tidesql/tidesdb
 COPY mysql-test/suite/tidesdb       /opt/tidesql/mysql-test/suite/tidesdb
 
-# 3. Build and install TidesDB library 
-RUN git clone --depth 1 --branch "${TIDESDB_VERSION}" \
+# 3. Build and install TidesDB library
+ARG WITH_S3=0
+RUN S3_FLAG=$([ "${WITH_S3}" = "1" ] && echo "-DTIDESDB_WITH_S3=ON" || true) && \
+    git clone --depth 1 --branch "${TIDESDB_VERSION}" \
         https://github.com/tidesdb/tidesdb.git /tmp/tidesql-build/tidesdb-lib && \
     cmake \
         -S /tmp/tidesql-build/tidesdb-lib \
@@ -43,7 +47,8 @@ RUN git clone --depth 1 --branch "${TIDESDB_VERSION}" \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_INSTALL_PREFIX="${TIDESDB_PREFIX}" \
         -DTIDESDB_BUILD_TESTS=OFF \
-        -DBUILD_SHARED_LIBS=ON && \
+        -DBUILD_SHARED_LIBS=ON \
+        ${S3_FLAG} && \
     cmake --build /tmp/tidesql-build/tidesdb-lib/build \
         --config Release --parallel "$(nproc)" && \
     cmake --install /tmp/tidesql-build/tidesdb-lib/build --config Release && \
@@ -69,6 +74,7 @@ RUN chmod +x /usr/local/bin/cmake_exclude_engines.sh
 RUN export TIDESDB_ROOT="${TIDESDB_PREFIX}" && \
     TEST_DIR_FLAG=$([ "${WITH_TESTS:-0}" = "1" ] || echo "-DINSTALL_MYSQLTESTDIR=OFF") && \
     ENGINE_FLAGS=$(cmake_exclude_engines.sh "${DISABLED_ENGINES:-}") && \
+    S3_FLAG=$([ "${WITH_S3}" = "1" ] && echo "-DTIDESDB_WITH_S3=ON" || true) && \
     cmake \
         -S /tmp/tidesql-build/mariadb-server \
         -B /tmp/tidesql-build/mariadb-server/build \
@@ -78,7 +84,8 @@ RUN export TIDESDB_ROOT="${TIDESDB_PREFIX}" && \
         -DWITH_UNIT_TESTS=OFF \
         -DCMAKE_PREFIX_PATH="${TIDESDB_PREFIX}" \
         ${TEST_DIR_FLAG} \
-        ${ENGINE_FLAGS} && \
+        ${ENGINE_FLAGS} \
+        ${S3_FLAG} && \
     cmake --build /tmp/tidesql-build/mariadb-server/build \
         --config RelWithDebInfo --parallel "$(nproc)" && \
     cmake --install /tmp/tidesql-build/mariadb-server/build \

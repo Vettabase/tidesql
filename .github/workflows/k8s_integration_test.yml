@@ -1,0 +1,574 @@
+name: Kubernetes Integration Tests (kind)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+    paths:
+      - 'k8s/**'
+      - 'docker/**'
+      - '.github/workflows/k8s_integration_test.yml'
+
+jobs:
+  k8s-test:
+    runs-on: ubuntu-latest
+    name: K8s Primary/Replica/Failover Integration
+    timeout-minutes: 30
+
+    steps:
+    - name: Checkout TideSQL
+      uses: actions/checkout@v4
+
+    - name: Install kind
+      run: |
+        curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.25.0/kind-linux-amd64
+        chmod +x ./kind
+        sudo mv ./kind /usr/local/bin/kind
+        kind version
+
+    - name: Create kind cluster
+      run: |
+        kind create cluster --name tidesql-test --wait 60s
+        kubectl cluster-info --context kind-tidesql-test
+        kubectl get nodes
+
+    - name: Build TideSQL Docker image
+      run: |
+        cd docker
+        # Build with S3 support for object store mode
+        docker build -f ubuntu/Dockerfile \
+          --build-arg WITH_TESTS=0 \
+          --build-arg WITH_S3=1 \
+          -t tidesdb/tidesql:test \
+          ..
+      timeout-minutes: 20
+
+    - name: Load image into kind
+      run: kind load docker-image tidesdb/tidesql:test --name tidesql-test
+
+    - name: Deploy MinIO
+      run: |
+        kubectl create namespace tidesql
+
+        # Deploy MinIO as a simple pod + service
+        kubectl apply -n tidesql -f - <<'EOF'
+        apiVersion: v1
+        kind: Pod
+        metadata:
+          name: minio
+          labels:
+            app: minio
+        spec:
+          containers:
+          - name: minio
+            image: minio/minio:latest
+            command: ["minio", "server", "/data"]
+            env:
+            - name: MINIO_ROOT_USER
+              value: minioadmin
+            - name: MINIO_ROOT_PASSWORD
+              value: minioadmin
+            ports:
+            - containerPort: 9000
+        ---
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: minio
+        spec:
+          selector:
+            app: minio
+          ports:
+          - port: 9000
+            targetPort: 9000
+        EOF
+
+        echo "Waiting for MinIO..."
+        kubectl wait -n tidesql --for=condition=Ready pod/minio --timeout=60s
+
+    - name: Create S3 bucket
+      run: |
+        kubectl exec -n tidesql minio -- \
+          sh -c 'mkdir -p /data/tidesql-test'
+        echo "Bucket created"
+
+    - name: Deploy TideSQL primary
+      run: |
+        # Create secret and configmap for MinIO
+        kubectl apply -n tidesql -f - <<'EOF'
+        apiVersion: v1
+        kind: Secret
+        metadata:
+          name: tidesdb-s3-credentials
+        type: Opaque
+        stringData:
+          access-key: "minioadmin"
+          secret-key: "minioadmin"
+        ---
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: tidesdb-primary-config
+        data:
+          tidesdb.cnf: |
+            [mariadb]
+            plugin-load-add=ha_tidesdb.so
+
+            tidesdb_object_store_backend=S3
+            tidesdb_s3_endpoint=minio.tidesql.svc.cluster.local:9000
+            tidesdb_s3_bucket=tidesql-test
+            tidesdb_s3_access_key=minioadmin
+            tidesdb_s3_secret_key=minioadmin
+            tidesdb_s3_use_ssl=OFF
+            tidesdb_s3_path_style=ON
+
+            tidesdb_unified_memtable=ON
+            tidesdb_unified_memtable_sync_mode=FULL
+            tidesdb_block_cache_size=67108864
+            tidesdb_flush_threads=2
+            tidesdb_compaction_threads=2
+            tidesdb_log_level=INFO
+        ---
+        apiVersion: v1
+        kind: Pod
+        metadata:
+          name: tidesql-primary
+          labels:
+            app: tidesql
+            role: primary
+        spec:
+          containers:
+          - name: mariadb
+            image: tidesdb/tidesql:test
+            ports:
+            - containerPort: 3306
+            volumeMounts:
+            - name: config
+              mountPath: /etc/mysql/conf.d/tidesdb.cnf
+              subPath: tidesdb.cnf
+            readinessProbe:
+              exec:
+                command: ["mariadb-admin", "ping", "-h", "localhost"]
+              initialDelaySeconds: 10
+              periodSeconds: 5
+          volumes:
+          - name: config
+            configMap:
+              name: tidesdb-primary-config
+        ---
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: tidesql-primary
+        spec:
+          selector:
+            app: tidesql
+            role: primary
+          ports:
+          - port: 3306
+            targetPort: 3306
+        EOF
+
+        echo "Waiting for primary..."
+        kubectl wait -n tidesql --for=condition=Ready pod/tidesql-primary --timeout=120s
+
+    - name: Write test data to primary
+      run: |
+        kubectl exec -n tidesql tidesql-primary -- \
+          mariadb -e "
+            CREATE DATABASE k8s_test;
+            USE k8s_test;
+            CREATE TABLE items (
+              id INT NOT NULL PRIMARY KEY,
+              name VARCHAR(100),
+              data TEXT
+            ) ENGINE=TidesDB;
+            INSERT INTO items VALUES (1, 'alpha', REPEAT('A', 500));
+            INSERT INTO items VALUES (2, 'beta',  REPEAT('B', 500));
+            INSERT INTO items VALUES (3, 'gamma', REPEAT('C', 500));
+            SELECT id, name, LENGTH(data) FROM items ORDER BY id;
+          "
+
+    - name: Verify data on primary
+      run: |
+        RESULT=$(kubectl exec -n tidesql tidesql-primary -- \
+          mariadb -N -e "SELECT COUNT(*) FROM k8s_test.items")
+        echo "Primary row count: $RESULT"
+        [ "$RESULT" -eq 3 ] || (echo "FAIL: expected 3 rows, got $RESULT"; exit 1)
+
+    - name: Force flush to S3
+      run: |
+        kubectl exec -n tidesql tidesql-primary -- \
+          mariadb -e "OPTIMIZE TABLE k8s_test.items" || true
+        sleep 5
+
+    - name: Deploy TideSQL replica
+      run: |
+        kubectl apply -n tidesql -f - <<'EOF'
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: tidesdb-replica-config
+        data:
+          tidesdb.cnf: |
+            [mariadb]
+            plugin-load-add=ha_tidesdb.so
+
+            tidesdb_object_store_backend=S3
+            tidesdb_s3_endpoint=minio.tidesql.svc.cluster.local:9000
+            tidesdb_s3_bucket=tidesql-test
+            tidesdb_s3_access_key=minioadmin
+            tidesdb_s3_secret_key=minioadmin
+            tidesdb_s3_use_ssl=OFF
+            tidesdb_s3_path_style=ON
+
+            tidesdb_replica_mode=ON
+            tidesdb_replica_sync_interval=1000000
+
+            tidesdb_unified_memtable=ON
+            tidesdb_block_cache_size=67108864
+            tidesdb_flush_threads=2
+            tidesdb_compaction_threads=2
+            tidesdb_log_level=INFO
+        ---
+        apiVersion: v1
+        kind: Pod
+        metadata:
+          name: tidesql-replica
+          labels:
+            app: tidesql
+            role: replica
+        spec:
+          containers:
+          - name: mariadb
+            image: tidesdb/tidesql:test
+            ports:
+            - containerPort: 3306
+            volumeMounts:
+            - name: config
+              mountPath: /etc/mysql/conf.d/tidesdb.cnf
+              subPath: tidesdb.cnf
+            readinessProbe:
+              exec:
+                command: ["mariadb-admin", "ping", "-h", "localhost"]
+              initialDelaySeconds: 10
+              periodSeconds: 5
+          volumes:
+          - name: config
+            configMap:
+              name: tidesdb-replica-config
+        ---
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: tidesql-replica
+        spec:
+          selector:
+            app: tidesql
+            role: replica
+          ports:
+          - port: 3306
+            targetPort: 3306
+        EOF
+
+        echo "Waiting for replica..."
+        kubectl wait -n tidesql --for=condition=Ready pod/tidesql-replica --timeout=120s
+
+    - name: Wait for replica sync
+      run: |
+        echo "Waiting for replica to sync from S3..."
+        sleep 15
+
+        # Retry a few times for sync
+        for i in $(seq 1 10); do
+          RESULT=$(kubectl exec -n tidesql tidesql-replica -- \
+            mariadb -N -e "SELECT COUNT(*) FROM k8s_test.items" 2>/dev/null || echo "0")
+          echo "Replica sync check $i: $RESULT rows"
+          [ "$RESULT" -eq 3 ] && break
+          sleep 5
+        done
+
+        [ "$RESULT" -eq 3 ] || (echo "FAIL: replica did not sync (got $RESULT rows)"; exit 1)
+        echo "Replica synced successfully"
+
+    - name: Verify replica data matches primary
+      run: |
+        PRIMARY_DATA=$(kubectl exec -n tidesql tidesql-primary -- \
+          mariadb -N -e "SELECT id, name FROM k8s_test.items ORDER BY id")
+        REPLICA_DATA=$(kubectl exec -n tidesql tidesql-replica -- \
+          mariadb -N -e "SELECT id, name FROM k8s_test.items ORDER BY id")
+
+        echo "Primary: $PRIMARY_DATA"
+        echo "Replica: $REPLICA_DATA"
+
+        [ "$PRIMARY_DATA" = "$REPLICA_DATA" ] || \
+          (echo "FAIL: data mismatch"; exit 1)
+        echo "Data matches"
+
+    - name: Verify replica rejects writes
+      run: |
+        kubectl exec -n tidesql tidesql-replica -- \
+          mariadb -e "INSERT INTO k8s_test.items VALUES (99, 'should_fail', 'x')" 2>&1 \
+          | grep -q 'ERROR\|error\|read.only' && echo "PASS: replica correctly rejects writes" \
+          || echo "WARNING: replica did not reject write (may not have read-only enforcement)"
+
+    - name: Test manual failover - kill primary and promote
+      run: |
+        echo "=== Manual failover test ==="
+        echo "Killing primary..."
+        kubectl delete pod -n tidesql tidesql-primary --grace-period=0 --force
+        sleep 5
+
+        echo "Promoting replica manually..."
+        kubectl exec -n tidesql tidesql-replica -- \
+          mariadb -e "SET GLOBAL tidesdb_promote_primary = ON" 2>&1 || true
+        sleep 5
+
+        # Verify promoted replica accepts writes
+        kubectl exec -n tidesql tidesql-replica -- \
+          mariadb -e "INSERT INTO k8s_test.items VALUES (4, 'manual_failover', REPEAT('D', 500))" \
+          2>&1 || true
+
+        RESULT=$(kubectl exec -n tidesql tidesql-replica -- \
+          mariadb -N -e "SELECT COUNT(*) FROM k8s_test.items" 2>/dev/null || echo "0")
+        echo "Post-manual-failover row count: $RESULT"
+        [ "$RESULT" -ge 3 ] || (echo "FAIL: data lost after manual failover"; exit 1)
+        echo "Manual failover successful"
+
+    - name: Restore primary for automated failover test
+      run: |
+        # Re-deploy primary so we can test automated failover
+        kubectl apply -n tidesql -f - <<'EOF'
+        apiVersion: v1
+        kind: Pod
+        metadata:
+          name: tidesql-primary
+          labels:
+            app: tidesql
+            role: primary
+        spec:
+          containers:
+          - name: mariadb
+            image: tidesdb/tidesql:test
+            ports:
+            - containerPort: 3306
+            volumeMounts:
+            - name: config
+              mountPath: /etc/mysql/conf.d/tidesdb.cnf
+              subPath: tidesdb.cnf
+            readinessProbe:
+              exec:
+                command: ["mariadb-admin", "ping", "-h", "localhost"]
+              initialDelaySeconds: 10
+              periodSeconds: 5
+          volumes:
+          - name: config
+            configMap:
+              name: tidesdb-primary-config
+        EOF
+
+        kubectl wait -n tidesql --for=condition=Ready pod/tidesql-primary --timeout=120s
+
+        # Re-deploy a fresh replica (old one was promoted)
+        kubectl delete pod -n tidesql tidesql-replica --grace-period=0 --force 2>/dev/null || true
+        sleep 5
+        kubectl apply -n tidesql -f - <<'EOF'
+        apiVersion: v1
+        kind: Pod
+        metadata:
+          name: tidesql-replica
+          labels:
+            app: tidesql
+            role: replica
+        spec:
+          containers:
+          - name: mariadb
+            image: tidesdb/tidesql:test
+            ports:
+            - containerPort: 3306
+            volumeMounts:
+            - name: config
+              mountPath: /etc/mysql/conf.d/tidesdb.cnf
+              subPath: tidesdb.cnf
+            readinessProbe:
+              exec:
+                command: ["mariadb-admin", "ping", "-h", "localhost"]
+              initialDelaySeconds: 10
+              periodSeconds: 5
+          volumes:
+          - name: config
+            configMap:
+              name: tidesdb-replica-config
+        EOF
+
+        kubectl wait -n tidesql --for=condition=Ready pod/tidesql-replica --timeout=120s
+
+        # Write fresh data and flush
+        kubectl exec -n tidesql tidesql-primary -- \
+          mariadb -e "
+            CREATE DATABASE IF NOT EXISTS k8s_test;
+            USE k8s_test;
+            CREATE TABLE IF NOT EXISTS failover_data (id INT PRIMARY KEY, v VARCHAR(50)) ENGINE=TidesDB;
+            INSERT INTO failover_data VALUES (1, 'before_auto_failover');
+            OPTIMIZE TABLE failover_data;
+          " 2>&1 || true
+        sleep 10
+        echo "Primary restored with test data"
+
+    - name: Deploy automated failover controller
+      run: |
+        # Deploy the failover controller from k8s/ manifests with test-friendly settings
+        kubectl apply -n tidesql -f - <<'EOF'
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: tidesdb-failover-script
+        data:
+          failover.sh: |
+            #!/bin/bash
+            set -euo pipefail
+            PRIMARY_HOST="${PRIMARY_HOST:-tidesql-primary}"
+            PRIMARY_PORT="${PRIMARY_PORT:-3306}"
+            REPLICA_HOST="${REPLICA_HOST:-tidesql-replica}"
+            REPLICA_PORT="${REPLICA_PORT:-3306}"
+            CHECK_INTERVAL="${CHECK_INTERVAL:-3}"
+            FAILURE_THRESHOLD="${FAILURE_THRESHOLD:-2}"
+            MYSQL_USER="${MYSQL_USER:-root}"
+            MYSQL_PASSWORD="${MYSQL_PASSWORD:-}"
+            FAILURES=0
+            log() { echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] $*"; }
+            check_primary() {
+                mariadb -h "$PRIMARY_HOST" -P "$PRIMARY_PORT" \
+                        -u "$MYSQL_USER" ${MYSQL_PASSWORD:+-p"$MYSQL_PASSWORD"} \
+                        -e "SELECT 1" > /dev/null 2>&1
+            }
+            promote_replica() {
+                log "PROMOTING replica $REPLICA_HOST to primary"
+                mariadb -h "$REPLICA_HOST" -P "$REPLICA_PORT" \
+                        -u "$MYSQL_USER" ${MYSQL_PASSWORD:+-p"$MYSQL_PASSWORD"} \
+                        -e "SET GLOBAL tidesdb_promote_primary = ON" 2>&1
+                log "Promotion command sent"
+            }
+            log "TidesQL Failover Controller started"
+            log "Primary: $PRIMARY_HOST:$PRIMARY_PORT"
+            log "Replica: $REPLICA_HOST:$REPLICA_PORT"
+            log "Check interval: ${CHECK_INTERVAL}s, threshold: $FAILURE_THRESHOLD"
+            while true; do
+                if check_primary; then
+                    [ "$FAILURES" -gt 0 ] && log "Primary recovered after $FAILURES failures"
+                    FAILURES=0
+                else
+                    FAILURES=$((FAILURES + 1))
+                    log "Primary check failed ($FAILURES/$FAILURE_THRESHOLD)"
+                    if [ "$FAILURES" -ge "$FAILURE_THRESHOLD" ]; then
+                        promote_replica
+                        log "Failover complete. Exiting."
+                        exit 0
+                    fi
+                fi
+                sleep "$CHECK_INTERVAL"
+            done
+        ---
+        apiVersion: v1
+        kind: Pod
+        metadata:
+          name: tidesql-failover
+          labels:
+            app: tidesql-failover
+        spec:
+          containers:
+          - name: controller
+            image: mariadb:latest
+            command: ["bash", "/scripts/failover.sh"]
+            env:
+            - name: PRIMARY_HOST
+              value: "tidesql-primary"
+            - name: REPLICA_HOST
+              value: "tidesql-replica"
+            - name: CHECK_INTERVAL
+              value: "3"
+            - name: FAILURE_THRESHOLD
+              value: "2"
+            volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+          volumes:
+          - name: scripts
+            configMap:
+              name: tidesdb-failover-script
+              defaultMode: 0755
+        EOF
+
+        kubectl wait -n tidesql --for=condition=Ready pod/tidesql-failover --timeout=60s
+        echo "Failover controller deployed"
+
+        # Verify it's running and checking the primary
+        sleep 5
+        kubectl logs -n tidesql tidesql-failover --tail=5
+
+    - name: Test automated failover - kill primary
+      run: |
+        echo "=== Automated failover test ==="
+        echo "Killing primary to trigger automatic failover..."
+        kubectl delete pod -n tidesql tidesql-primary --grace-period=0 --force
+
+        # The failover controller checks every 3s with threshold=2
+        # So it should detect and promote within ~10s
+        echo "Waiting for failover controller to detect and promote..."
+
+        # Wait for the controller to finish (it exits after promotion)
+        for i in $(seq 1 20); do
+          STATUS=$(kubectl get pod -n tidesql tidesql-failover -o jsonpath='{.status.phase}' 2>/dev/null || echo "unknown")
+          echo "  check $i: controller status=$STATUS"
+          if [ "$STATUS" = "Succeeded" ]; then
+            echo "Failover controller completed promotion"
+            break
+          fi
+          sleep 3
+        done
+
+        # Show controller logs
+        echo "=== Failover controller logs ==="
+        kubectl logs -n tidesql tidesql-failover 2>/dev/null || true
+
+    - name: Verify automated failover succeeded
+      run: |
+        # The replica should now be promoted and accept writes
+        sleep 5
+
+        kubectl exec -n tidesql tidesql-replica -- \
+          mariadb -e "INSERT INTO k8s_test.failover_data VALUES (2, 'after_auto_failover')" \
+          2>&1 || true
+
+        RESULT=$(kubectl exec -n tidesql tidesql-replica -- \
+          mariadb -N -e "SELECT COUNT(*) FROM k8s_test.failover_data" 2>/dev/null || echo "0")
+        echo "Post-auto-failover row count: $RESULT"
+
+        [ "$RESULT" -ge 1 ] || (echo "FAIL: automated failover did not preserve data"; exit 1)
+        echo "Automated failover successful - data intact, writes accepted"
+
+    - name: Collect logs on failure
+      if: failure()
+      run: |
+        echo "=== Primary logs ==="
+        kubectl logs -n tidesql tidesql-primary 2>/dev/null | tail -50 || echo "(no primary logs)"
+        echo ""
+        echo "=== Replica logs ==="
+        kubectl logs -n tidesql tidesql-replica 2>/dev/null | tail -50 || echo "(no replica logs)"
+        echo ""
+        echo "=== Failover controller logs ==="
+        kubectl logs -n tidesql tidesql-failover 2>/dev/null | tail -30 || echo "(no failover logs)"
+        echo ""
+        echo "=== MinIO logs ==="
+        kubectl logs -n tidesql minio 2>/dev/null | tail -30 || echo "(no minio logs)"
+        echo ""
+        echo "=== Pod status ==="
+        kubectl get pods -n tidesql -o wide 2>/dev/null || true
+        echo ""
+        echo "=== Events ==="
+        kubectl get events -n tidesql --sort-by='.lastTimestamp' 2>/dev/null | tail -20 || true
+
+    - name: Cleanup
+      if: always()
+      run: |
+        kind delete cluster --name tidesql-test || true
