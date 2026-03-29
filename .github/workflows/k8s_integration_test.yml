@@ -153,7 +153,7 @@ jobs:
             command: ["/bin/bash", "-c"]
             args:
             - |
-              mkdir -p /etc/mysql/custom && cp /opt/tidesdb-config/tidesdb.cnf /etc/mysql/custom/tidesdb-k8s.cfg && echo "[k8s] TidesDB S3 config injected" || echo "[k8s] WARNING: config copy failed"
+              mkdir -p /etc/mysql/custom && cp /opt/tidesdb-config/tidesdb.cnf /etc/mysql/custom/tidesdb-k8s.cnf && echo "[k8s] TidesDB S3 config injected" || echo "[k8s] WARNING: config copy failed"
               exec /usr/local/bin/tidesql-entrypoint.sh
             ports:
             - containerPort: 3306
@@ -191,7 +191,7 @@ jobs:
       run: |
         echo "=== Config file injected into primary ==="
         kubectl exec -n tidesql tidesql-primary -- \
-          cat /etc/mysql/custom/tidesdb-k8s.cfg 2>/dev/null || echo "(file missing!)"
+          cat /etc/mysql/custom/tidesdb-k8s.cnf 2>/dev/null || echo "(file missing!)"
 
         echo ""
         echo "=== S3 system variables ==="
@@ -297,7 +297,7 @@ jobs:
             command: ["/bin/bash", "-c"]
             args:
             - |
-              mkdir -p /etc/mysql/custom && cp /opt/tidesdb-config/tidesdb.cnf /etc/mysql/custom/tidesdb-k8s.cfg && echo "[k8s] TidesDB S3 config injected" || echo "[k8s] WARNING: config copy failed"
+              mkdir -p /etc/mysql/custom && cp /opt/tidesdb-config/tidesdb.cnf /etc/mysql/custom/tidesdb-k8s.cnf && echo "[k8s] TidesDB S3 config injected" || echo "[k8s] WARNING: config copy failed"
               exec /usr/local/bin/tidesql-entrypoint.sh
             ports:
             - containerPort: 3306
@@ -425,7 +425,7 @@ jobs:
             command: ["/bin/bash", "-c"]
             args:
             - |
-              mkdir -p /etc/mysql/custom && cp /opt/tidesdb-config/tidesdb.cnf /etc/mysql/custom/tidesdb-k8s.cfg && echo "[k8s] TidesDB S3 config injected" || echo "[k8s] WARNING: config copy failed"
+              mkdir -p /etc/mysql/custom && cp /opt/tidesdb-config/tidesdb.cnf /etc/mysql/custom/tidesdb-k8s.cnf && echo "[k8s] TidesDB S3 config injected" || echo "[k8s] WARNING: config copy failed"
               exec /usr/local/bin/tidesql-entrypoint.sh
             ports:
             - containerPort: 3306
@@ -464,7 +464,7 @@ jobs:
             command: ["/bin/bash", "-c"]
             args:
             - |
-              mkdir -p /etc/mysql/custom && cp /opt/tidesdb-config/tidesdb.cnf /etc/mysql/custom/tidesdb-k8s.cfg && echo "[k8s] TidesDB S3 config injected" || echo "[k8s] WARNING: config copy failed"
+              mkdir -p /etc/mysql/custom && cp /opt/tidesdb-config/tidesdb.cnf /etc/mysql/custom/tidesdb-k8s.cnf && echo "[k8s] TidesDB S3 config injected" || echo "[k8s] WARNING: config copy failed"
               exec /usr/local/bin/tidesql-entrypoint.sh
             ports:
             - containerPort: 3306
@@ -645,7 +645,7 @@ jobs:
         echo ""
         echo "=== Primary config ==="
         kubectl exec -n tidesql tidesql-primary -- \
-          cat /etc/mysql/custom/tidesdb-k8s.cfg 2>/dev/null || echo "(missing)"
+          cat /etc/mysql/custom/tidesdb-k8s.cnf 2>/dev/null || echo "(missing)"
         echo ""
         echo "=== Replica container logs ==="
         kubectl logs -n tidesql tidesql-replica 2>/dev/null | tail -50 || echo "(none)"
