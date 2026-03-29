@@ -2483,6 +2483,7 @@ static int tidesdb_init_func(void *p)
         objstore_cfg.local_cache_max_bytes = (size_t)srv_objstore_local_cache_max;
         objstore_cfg.wal_sync_threshold_bytes = (size_t)srv_objstore_wal_sync_threshold;
         objstore_cfg.wal_sync_on_commit = srv_objstore_wal_sync_on_commit ? 1 : 0;
+        objstore_cfg.replicate_wal = 1; /* upload WAL segments for replica recovery */
         objstore_cfg.replica_mode = srv_replica_mode ? 1 : 0;
         objstore_cfg.replica_sync_interval_us = (uint64_t)srv_replica_sync_interval;
         objstore_cfg.replica_replay_wal = 1;
