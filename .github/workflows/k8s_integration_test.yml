@@ -30,11 +30,21 @@ jobs:
         kubectl cluster-info --context kind-tidesql-test
         kubectl get nodes
 
+    - name: Resolve TidesDB version
+      id: tidesdb-version
+      run: |
+        TAG=$(curl -sf https://api.github.com/repos/tidesdb/tidesdb/releases/latest \
+              | grep '"tag_name"' | head -1 | cut -d'"' -f4)
+        [ -z "$TAG" ] && TAG="master"
+        echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+        echo "TidesDB version: $TAG"
+
     - name: Build TideSQL Docker image
       run: |
         cd docker
-        # Build with S3 support for object store mode
         docker build -f ubuntu/Dockerfile \
+          --build-arg MARIADB_VERSION=mariadb-11.8.6 \
+          --build-arg TIDESDB_VERSION=${{ steps.tidesdb-version.outputs.tag }} \
           --build-arg WITH_TESTS=0 \
           --build-arg WITH_S3=1 \
           -t tidesdb/tidesql:test \
