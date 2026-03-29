@@ -47,9 +47,10 @@ jobs:
           --build-arg TIDESDB_VERSION=${{ steps.tidesdb-version.outputs.tag }} \
           --build-arg WITH_TESTS=0 \
           --build-arg WITH_S3=1 \
+          --build-arg DISABLED_ENGINES="ROCKSDB,MROONGA,SPIDER,CONNECT,OQGRAPH,COLUMNSTORE,SPHINX" \
           -t tidesdb/tidesql:test \
           ..
-      timeout-minutes: 20
+      timeout-minutes: 30
 
     - name: Load image into kind
       run: kind load docker-image tidesdb/tidesql:test --name tidesql-test
