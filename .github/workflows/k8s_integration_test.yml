@@ -149,11 +149,16 @@ jobs:
           containers:
           - name: mariadb
             image: tidesdb/tidesql:test
+            command: ["/bin/bash", "-c"]
+            args:
+            - |
+              cp /opt/tidesdb-config/tidesdb.cnf /etc/mysql/custom/tidesdb-k8s.cfg || true
+              exec /usr/local/bin/tidesql-entrypoint.sh
             ports:
             - containerPort: 3306
             volumeMounts:
             - name: config
-              mountPath: /etc/mysql/conf.d/tidesdb.cnf
+              mountPath: /opt/tidesdb-config/tidesdb.cnf
               subPath: tidesdb.cnf
             readinessProbe:
               exec:
@@ -251,11 +256,16 @@ jobs:
           containers:
           - name: mariadb
             image: tidesdb/tidesql:test
+            command: ["/bin/bash", "-c"]
+            args:
+            - |
+              cp /opt/tidesdb-config/tidesdb.cnf /etc/mysql/custom/tidesdb-k8s.cfg || true
+              exec /usr/local/bin/tidesql-entrypoint.sh
             ports:
             - containerPort: 3306
             volumeMounts:
             - name: config
-              mountPath: /etc/mysql/conf.d/tidesdb.cnf
+              mountPath: /opt/tidesdb-config/tidesdb.cnf
               subPath: tidesdb.cnf
             readinessProbe:
               exec:
@@ -359,11 +369,16 @@ jobs:
           containers:
           - name: mariadb
             image: tidesdb/tidesql:test
+            command: ["/bin/bash", "-c"]
+            args:
+            - |
+              cp /opt/tidesdb-config/tidesdb.cnf /etc/mysql/custom/tidesdb-k8s.cfg || true
+              exec /usr/local/bin/tidesql-entrypoint.sh
             ports:
             - containerPort: 3306
             volumeMounts:
             - name: config
-              mountPath: /etc/mysql/conf.d/tidesdb.cnf
+              mountPath: /opt/tidesdb-config/tidesdb.cnf
               subPath: tidesdb.cnf
             readinessProbe:
               exec:
@@ -393,11 +408,16 @@ jobs:
           containers:
           - name: mariadb
             image: tidesdb/tidesql:test
+            command: ["/bin/bash", "-c"]
+            args:
+            - |
+              cp /opt/tidesdb-config/tidesdb.cnf /etc/mysql/custom/tidesdb-k8s.cfg || true
+              exec /usr/local/bin/tidesql-entrypoint.sh
             ports:
             - containerPort: 3306
             volumeMounts:
             - name: config
-              mountPath: /etc/mysql/conf.d/tidesdb.cnf
+              mountPath: /opt/tidesdb-config/tidesdb.cnf
               subPath: tidesdb.cnf
             readinessProbe:
               exec:
