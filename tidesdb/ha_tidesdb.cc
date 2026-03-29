@@ -21,7 +21,14 @@ extern "C"
 #define XXH_INLINE_ALL
 #include <tidesdb/xxhash.h>
 #ifdef TIDESDB_WITH_S3
-#include <tidesdb/objstore_s3.h>
+    /* Forward-declare the S3 connector factory instead of including objstore_s3.h
+       which pulls in compat.h, that header uses C11 _Atomic types that are not
+       valid in C++ mode.  The types we need (tidesdb_objstore_t) are already
+       declared via db.h in ha_tidesdb.h. */
+    tidesdb_objstore_t *tidesdb_objstore_s3_create(const char *endpoint, const char *bucket,
+                                                   const char *prefix, const char *access_key,
+                                                   const char *secret_key, const char *region,
+                                                   int use_ssl, int use_path_style);
 #endif
 }
 

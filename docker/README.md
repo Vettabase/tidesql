@@ -83,6 +83,8 @@ Some of them currently cannot be changed by using the scripts.
   TIDESDB_PREFIX    TidesDB install prefix            Default: /usr/local
   MARIADB_PREFIX    MariaDB install prefix            Default: /usr/local/mariadb
   WITH_TESTS        Include MTR in the image. 1=yes, 0=no. Default: 0
+  WITH_S3           Build with S3 object store support. 1=yes, 0=no. Default: 0
+                    Requires libcurl and OpenSSL (already in the base image).
   DISABLED_ENGINES  Normally set indirectly via EXCLUDE_ENGINES /
                     INCLUDE_ENGINES in rebuild.sh (see REBUILD SCRIPT above).
 ```
@@ -98,9 +100,21 @@ Example - include the test suite:
   docker build \
       -f docker/ubuntu/Dockerfile \
       --build-arg MARIADB_VERSION=12.2.2 \
-      --build-arg TIDESDB_VERSION=v8.9.3 \
+      --build-arg TIDESDB_VERSION=v9.0.0 \
       --build-arg WITH_TESTS=1 \
       -t tidesql:12.2.2-ubuntu-tests \
+      .
+```
+
+Example - build with S3 object store support:
+
+```
+  docker build \
+      -f docker/ubuntu/Dockerfile \
+      --build-arg MARIADB_VERSION=11.8.6 \
+      --build-arg TIDESDB_VERSION=v9.0.0 \
+      --build-arg WITH_S3=1 \
+      -t tidesql:11.8.6-s3 \
       .
 ```
 

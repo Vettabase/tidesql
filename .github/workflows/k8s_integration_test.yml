@@ -1,13 +1,11 @@
 name: Kubernetes Integration Tests (kind)
 
 on:
-  workflow_dispatch:
   push:
     branches: [ main, master ]
-    paths:
-      - 'k8s/**'
-      - 'docker/**'
-      - '.github/workflows/k8s_integration_test.yml'
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
 
 jobs:
   k8s-test:
