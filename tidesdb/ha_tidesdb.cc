@@ -310,6 +310,7 @@ static void row_locks_release_all(tidesdb_trx_t *trx)
 }
 
 static handler *tidesdb_create_handler(handlerton *hton, TABLE_SHARE *table, MEM_ROOT *mem_root);
+static void tidesdb_refresh_status_vars();
 
 /* File extensions -- TidesDB manages its own files */
 static const char *ha_tidesdb_exts[] = {NullS};
@@ -2258,6 +2259,9 @@ static bool tidesdb_show_status(handlerton *hton, THD *thd, stat_print_fn *print
 {
     if (stat != HA_ENGINE_STATUS) return false;
     if (!tdb_global) return false;
+
+    /* Refresh SHOW GLOBAL STATUS variables alongside the human-readable output */
+    tidesdb_refresh_status_vars();
 
     /* Database-level stats */
     tidesdb_db_stats_t db_st;
@@ -5565,6 +5569,9 @@ int ha_tidesdb::info(uint flag)
                 tidesdb_free_stats(st);
             }
             share->stats_refresh_us.store(now, std::memory_order_relaxed);
+
+            /* Also refresh SHOW GLOBAL STATUS variables while we're updating stats */
+            tidesdb_refresh_status_vars();
         }
 
         /* We feed all cached values to the optimizer */
@@ -7432,6 +7439,89 @@ int ha_tidesdb::delete_table(const char *name)
     DBUG_RETURN(tidesdb_drop_table_impl(name));
 }
 
+/* ******************** Status variables (SHOW GLOBAL STATUS LIKE 'tidesdb%') ********************
+ */
+
+/* Static holders for status variable values.  Populated by the SHOW_FUNC
+   callback which queries tidesdb_get_db_stats / tidesdb_get_cache_stats.
+   These are global (not per-connection) since they reflect database-wide state. */
+static long long srv_stat_column_families;
+static long long srv_stat_global_seq;
+static long long srv_stat_memtable_bytes;
+static long long srv_stat_txn_memory_bytes;
+static long long srv_stat_memory_limit;
+static long long srv_stat_memory_pressure;
+static long long srv_stat_total_sstables;
+static long long srv_stat_open_sstables;
+static long long srv_stat_data_size_bytes;
+static long long srv_stat_immutable_memtables;
+static long long srv_stat_flush_pending;
+static long long srv_stat_flush_queue;
+static long long srv_stat_compaction_queue;
+static long long srv_stat_cache_entries;
+static long long srv_stat_cache_bytes;
+static long long srv_stat_cache_hits;
+static long long srv_stat_cache_misses;
+static double srv_stat_cache_hit_rate;
+static long long srv_stat_cache_partitions;
+
+static struct st_mysql_show_var tidesdb_status_variables[] = {
+    {"tidesdb_column_families", (char *)&srv_stat_column_families, SHOW_LONGLONG},
+    {"tidesdb_global_sequence", (char *)&srv_stat_global_seq, SHOW_LONGLONG},
+    {"tidesdb_memtable_bytes", (char *)&srv_stat_memtable_bytes, SHOW_LONGLONG},
+    {"tidesdb_txn_memory_bytes", (char *)&srv_stat_txn_memory_bytes, SHOW_LONGLONG},
+    {"tidesdb_memory_limit", (char *)&srv_stat_memory_limit, SHOW_LONGLONG},
+    {"tidesdb_memory_pressure", (char *)&srv_stat_memory_pressure, SHOW_LONGLONG},
+    {"tidesdb_total_sstables", (char *)&srv_stat_total_sstables, SHOW_LONGLONG},
+    {"tidesdb_open_sstables", (char *)&srv_stat_open_sstables, SHOW_LONGLONG},
+    {"tidesdb_data_size_bytes", (char *)&srv_stat_data_size_bytes, SHOW_LONGLONG},
+    {"tidesdb_immutable_memtables", (char *)&srv_stat_immutable_memtables, SHOW_LONGLONG},
+    {"tidesdb_flush_pending", (char *)&srv_stat_flush_pending, SHOW_LONGLONG},
+    {"tidesdb_flush_queue", (char *)&srv_stat_flush_queue, SHOW_LONGLONG},
+    {"tidesdb_compaction_queue", (char *)&srv_stat_compaction_queue, SHOW_LONGLONG},
+    {"tidesdb_cache_entries", (char *)&srv_stat_cache_entries, SHOW_LONGLONG},
+    {"tidesdb_cache_bytes", (char *)&srv_stat_cache_bytes, SHOW_LONGLONG},
+    {"tidesdb_cache_hits", (char *)&srv_stat_cache_hits, SHOW_LONGLONG},
+    {"tidesdb_cache_misses", (char *)&srv_stat_cache_misses, SHOW_LONGLONG},
+    {"tidesdb_cache_hit_rate", (char *)&srv_stat_cache_hit_rate, SHOW_DOUBLE},
+    {"tidesdb_cache_partitions", (char *)&srv_stat_cache_partitions, SHOW_LONGLONG},
+    {NullS, NullS, SHOW_ULONG}};
+
+/* Refresh status variable values from the library.
+   Called from tidesdb_show_status (SHOW ENGINE STATUS) and periodically. */
+static void tidesdb_refresh_status_vars()
+{
+    if (!tdb_global) return;
+
+    tidesdb_db_stats_t db_st;
+    memset(&db_st, 0, sizeof(db_st));
+    tidesdb_get_db_stats(tdb_global, &db_st);
+
+    tidesdb_cache_stats_t cache_st;
+    memset(&cache_st, 0, sizeof(cache_st));
+    tidesdb_get_cache_stats(tdb_global, &cache_st);
+
+    srv_stat_column_families = db_st.num_column_families;
+    srv_stat_global_seq = (long long)db_st.global_seq;
+    srv_stat_memtable_bytes = (long long)db_st.total_memtable_bytes;
+    srv_stat_txn_memory_bytes = (long long)db_st.txn_memory_bytes;
+    srv_stat_memory_limit = (long long)db_st.resolved_memory_limit;
+    srv_stat_memory_pressure = db_st.memory_pressure_level;
+    srv_stat_total_sstables = db_st.total_sstable_count;
+    srv_stat_open_sstables = db_st.num_open_sstables;
+    srv_stat_data_size_bytes = (long long)db_st.total_data_size_bytes;
+    srv_stat_immutable_memtables = db_st.total_immutable_count;
+    srv_stat_flush_pending = db_st.flush_pending_count;
+    srv_stat_flush_queue = (long long)db_st.flush_queue_size;
+    srv_stat_compaction_queue = (long long)db_st.compaction_queue_size;
+    srv_stat_cache_entries = (long long)cache_st.total_entries;
+    srv_stat_cache_bytes = (long long)cache_st.total_bytes;
+    srv_stat_cache_hits = (long long)cache_st.hits;
+    srv_stat_cache_misses = (long long)cache_st.misses;
+    srv_stat_cache_hit_rate = cache_st.hit_rate * 100.0;
+    srv_stat_cache_partitions = (long long)cache_st.num_partitions;
+}
+
 /* ******************** Plugin declaration ******************** */
 
 static struct st_mysql_storage_engine tidesdb_storage_engine = {MYSQL_HANDLERTON_INTERFACE_VERSION};
@@ -7446,7 +7536,7 @@ maria_declare_plugin(tidesdb){MYSQL_STORAGE_ENGINE_PLUGIN,
                               tidesdb_init_func,
                               tidesdb_deinit_func,
                               0x40200,
-                              NULL,
+                              tidesdb_status_variables,
                               tidesdb_system_variables,
                               "4.2.0",
                               MariaDB_PLUGIN_MATURITY_GAMMA} maria_declare_plugin_end;

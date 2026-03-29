@@ -229,6 +229,8 @@ Core:
 - Hard-link checkpoint (SET GLOBAL tidesdb_checkpoint_dir = '/path')
 - OPTIMIZE TABLE (synchronous purge + compact via tidesdb_purge_cf)
 - SHOW ENGINE TIDESDB STATUS (DB stats, memory, cache, conflict info)
+- SHOW GLOBAL STATUS LIKE 'tidesdb%' (19 machine-readable status variables
+  for monitoring tools: Prometheus, PMM, Datadog, etc.)
 - Partitioning (RANGE, LIST, HASH, KEY)
 - Data-at-rest encryption (MariaDB encryption plugin integration)
 - Online DDL (instant metadata, inplace add/drop index, copy for columns)
