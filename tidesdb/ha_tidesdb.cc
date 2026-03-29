@@ -28,6 +28,7 @@ extern "C"
 #include <mysql/plugin.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <memory>
 #include <string>
@@ -3521,13 +3522,17 @@ const std::string &ha_tidesdb::serialize_row(const uchar *buf)
 {
     my_ptrdiff_t ptrdiff = (my_ptrdiff_t)(buf - table->record[0]);
 
-    /* Upper-bound packed size -- header + null_bytes + reclength + overhead.
-       Add 2 bytes per field for length-prefix overhead-- Field_string::pack()
-       (CHAR columns) prepends a 1-2 byte length that is not included in
-       reclength.
-       For BLOBs, add actual data sizes since Field_blob::pack() inlines data. */
-    size_t est =
-        ROW_HEADER_SIZE + table->s->null_bytes + table->s->reclength + 2 * table->s->fields;
+    /* Upper-bound packed size.  For non-BLOB tables the estimate is constant
+       (header + null_bytes + reclength + 2 bytes per field for length-prefix
+       overhead from Field_string::pack).  Cache it to avoid recomputing on
+       every row.  For BLOB tables we must add the actual blob data sizes. */
+    size_t est = share->cached_row_est;
+    if (unlikely(est == 0))
+    {
+        est = ROW_HEADER_SIZE + table->s->null_bytes + table->s->reclength + 2 * table->s->fields;
+        if (!share->has_blobs)
+            share->cached_row_est = est; /* safe to cache -- constant for non-BLOB tables */
+    }
     if (share->has_blobs)
     {
         for (uint i = 0; i < table->s->fields; i++)
@@ -3968,7 +3973,6 @@ int ha_tidesdb::write_row(const uchar *buf)
         {
             tidesdb_free(dup_val);
             errkey = lookup_errkey = share->pk_index;
-            /* We populate dup_ref so rnd_pos() can find the conflicting row */
             memcpy(dup_ref, pk, pk_len);
             tmp_restore_column_map(&table->read_set, old_map);
             DBUG_RETURN(HA_ERR_FOUND_DUPP_KEY);
@@ -5859,29 +5863,49 @@ IO_AND_CPU_COST ha_tidesdb::scan_time()
 
     if (!share || !share->cf) return cost;
 
-    /* We use tidesdb_range_cost over the full key space of the data CF.
-       This accounts for the actual LSM structure (number of levels,
-       SSTables, compression, merge overhead) rather than the generic
-       data_file_length / IO_SIZE estimate. */
-    uchar lo[2] = {KEY_NS_DATA};
-    uchar hi[MAX_KEY_LENGTH + 2];
-    memset(hi, 0xFF, sizeof(hi));
-    uint hi_len = 1 + share->pk_key_len;
-    if (hi_len > sizeof(hi)) hi_len = sizeof(hi);
+    /* Cache the range_cost result on the share with the same refresh
+       interval as stats (TIDESDB_STATS_REFRESH_US = 2 seconds).
+       tidesdb_range_cost examines in-memory metadata (block indexes,
+       SSTable min/max keys) without disk I/O, but the computation
+       still costs ~0.17% of TPC-C CPU when called per query plan. */
+    auto now = std::chrono::steady_clock::now();
+    auto cached_time = share->scan_cost_time.load(std::memory_order_relaxed);
+    double cached_cost = share->cached_scan_cost.load(std::memory_order_relaxed);
 
-    double full_cost = 0.0;
-    if (tidesdb_range_cost(share->cf, lo, 1, hi, hi_len, &full_cost) == TDB_SUCCESS &&
-        full_cost > 0.0)
+    bool stale =
+        (cached_cost <= 0.0) ||
+        (std::chrono::duration_cast<std::chrono::microseconds>(now.time_since_epoch()).count() -
+             cached_time >
+         TIDESDB_STATS_REFRESH_US);
+
+    if (stale)
     {
-        /* Split the cost -- block reads are I/O, per-entry processing is CPU.
-           tidesdb_range_cost weights blocks at ~1.0-1.5x and entries at 0.01x,
-           so I/O dominates.  We assign 90% to I/O, 10% to CPU. */
-        cost.io = full_cost * 0.9;
-        cost.cpu = full_cost * 0.1;
+        uchar lo[2] = {KEY_NS_DATA};
+        uchar hi[MAX_KEY_LENGTH + 2];
+        memset(hi, 0xFF, sizeof(hi));
+        uint hi_len = 1 + share->pk_key_len;
+        if (hi_len > sizeof(hi)) hi_len = sizeof(hi);
+
+        double full_cost = 0.0;
+        if (tidesdb_range_cost(share->cf, lo, 1, hi, hi_len, &full_cost) == TDB_SUCCESS &&
+            full_cost > 0.0)
+        {
+            cached_cost = full_cost;
+            share->cached_scan_cost.store(cached_cost, std::memory_order_relaxed);
+            share->scan_cost_time.store(
+                std::chrono::duration_cast<std::chrono::microseconds>(now.time_since_epoch())
+                    .count(),
+                std::memory_order_relaxed);
+        }
+    }
+
+    if (cached_cost > 0.0)
+    {
+        cost.io = cached_cost * 0.9;
+        cost.cpu = cached_cost * 0.1;
     }
     else
     {
-        /* We fallback to base implementation */
         cost = handler::scan_time();
     }
 
@@ -6558,6 +6582,12 @@ int ha_tidesdb::ensure_stmt_txn()
     bool is_autocommit = !thd_test_options(thd, OPTION_NOT_AUTOCOMMIT | OPTION_BEGIN);
     tidesdb_isolation_level_t effective_iso;
     if (is_ddl || is_autocommit)
+        effective_iso = TDB_ISOLATION_READ_COMMITTED;
+    else if (unlikely(srv_pessimistic_locking))
+        /* When pessimistic row locks are active, the locks already serialize
+           access to hot rows.  Use READ_COMMITTED to skip the library's
+           write-write conflict tracking at commit time -- the lock manager
+           prevents the conflicts that tracking would detect. */
         effective_iso = TDB_ISOLATION_READ_COMMITTED;
     else
         effective_iso = resolve_effective_isolation(

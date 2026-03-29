@@ -119,6 +119,11 @@ class TidesDB_share : public Handler_share
     bool has_blobs;             /* true when table contains any BLOB/TEXT columns */
     bool has_ttl;               /* true when TTL is configured (default_ttl or ttl_field_idx) */
     uint num_secondary_indexes; /* count of non-NULL secondary index CFs */
+    size_t cached_row_est{0};   /* cached serialize_row size estimate for non-BLOB tables */
+
+    /* Cached scan_time range cost (refreshed every TIDESDB_STATS_REFRESH_US) */
+    std::atomic<double> cached_scan_cost{0.0};
+    std::atomic<long long> scan_cost_time{0};
 
     /* Table timestamps for information_schema.TABLES */
     time_t create_time{0};              /* from .frm stat at first open */
