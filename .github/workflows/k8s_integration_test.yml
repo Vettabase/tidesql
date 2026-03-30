@@ -194,7 +194,7 @@ jobs:
         # the failover controller (a separate pod) can use over TCP.
         kubectl exec -n tidesql tidesql-primary -- \
           mariadb -e "
-            CREATE USER IF NOT EXISTS 'monitor'@'%' IDENTIFIED BY 'monitor';
+            CREATE USER IF NOT EXISTS 'monitor'@'%' IDENTIFIED BY 'M0nitor!Pass9';
             GRANT ALL PRIVILEGES ON *.* TO 'monitor'@'%' WITH GRANT OPTION;
             FLUSH PRIVILEGES;
           "
@@ -355,7 +355,7 @@ jobs:
         # Create monitor user on replica for failover controller access
         kubectl exec -n tidesql tidesql-replica -- \
           mariadb -e "
-            CREATE USER IF NOT EXISTS 'monitor'@'%' IDENTIFIED BY 'monitor';
+            CREATE USER IF NOT EXISTS 'monitor'@'%' IDENTIFIED BY 'M0nitor!Pass9';
             GRANT ALL PRIVILEGES ON *.* TO 'monitor'@'%' WITH GRANT OPTION;
             FLUSH PRIVILEGES;
           "
@@ -479,7 +479,7 @@ jobs:
         # Create monitor user on new primary
         kubectl exec -n tidesql tidesql-primary -- \
           mariadb -e "
-            CREATE USER IF NOT EXISTS 'monitor'@'%' IDENTIFIED BY 'monitor';
+            CREATE USER IF NOT EXISTS 'monitor'@'%' IDENTIFIED BY 'M0nitor!Pass9';
             GRANT ALL PRIVILEGES ON *.* TO 'monitor'@'%' WITH GRANT OPTION;
             FLUSH PRIVILEGES;
           "
@@ -526,7 +526,7 @@ jobs:
         # Create monitor user on fresh replica
         kubectl exec -n tidesql tidesql-replica -- \
           mariadb -e "
-            CREATE USER IF NOT EXISTS 'monitor'@'%' IDENTIFIED BY 'monitor';
+            CREATE USER IF NOT EXISTS 'monitor'@'%' IDENTIFIED BY 'M0nitor!Pass9';
             GRANT ALL PRIVILEGES ON *.* TO 'monitor'@'%' WITH GRANT OPTION;
             FLUSH PRIVILEGES;
           "
@@ -564,7 +564,7 @@ jobs:
             CHECK_INTERVAL="${CHECK_INTERVAL:-3}"
             FAILURE_THRESHOLD="${FAILURE_THRESHOLD:-2}"
             MYSQL_USER="${MYSQL_USER:-monitor}"
-            MYSQL_PASSWORD="${MYSQL_PASSWORD:-monitor}"
+            MYSQL_PASSWORD="${MYSQL_PASSWORD:-M0nitor!Pass9}"
             FAILURES=0
             log() { echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] $*"; }
             check_primary() {
@@ -623,7 +623,7 @@ jobs:
             - name: MYSQL_USER
               value: "monitor"
             - name: MYSQL_PASSWORD
-              value: "monitor"
+              value: "M0nitor!Pass9"
             volumeMounts:
             - name: scripts
               mountPath: /scripts
