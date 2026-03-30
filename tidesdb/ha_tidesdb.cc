@@ -2655,6 +2655,76 @@ static int tidesdb_discover_table_existence(handlerton *, const char *db, const 
     return (rc == TDB_SUCCESS) ? 1 : 0;
 }
 
+/*
+  Scan the schema CF for all unique database names and create any missing
+  database directories under mysql_real_data_home.  This ensures that
+  replicas (which receive table definitions via S3) have the database
+  directory present so MariaDB will call discover_table_names for them.
+  Without the directory, MariaDB doesn't know the database exists and
+  never asks TidesDB about its tables.
+*/
+static void schema_cf_ensure_databases()
+{
+    if (!schema_cf) return;
+
+    tidesdb_txn_t *txn = NULL;
+    if (tidesdb_txn_begin(tdb_global, &txn) != TDB_SUCCESS) return;
+
+    tidesdb_iter_t *iter = NULL;
+    if (tidesdb_iter_new(txn, schema_cf, &iter) != TDB_SUCCESS || !iter)
+    {
+        tidesdb_txn_rollback(txn);
+        tidesdb_txn_free(txn);
+        return;
+    }
+
+    std::unordered_set<std::string> seen_dbs;
+
+    tidesdb_iter_seek_to_first(iter);
+    while (tidesdb_iter_valid(iter))
+    {
+        uint8_t *kp = NULL;
+        size_t klen = 0;
+        if (tidesdb_iter_key(iter, &kp, &klen) != TDB_SUCCESS || !kp) break;
+
+        /* Key format: "db_name\0table_name" — find the null separator */
+        const char *kstr = (const char *)kp;
+        size_t sep = 0;
+        for (; sep < klen; sep++)
+        {
+            if (kstr[sep] == '\0') break;
+        }
+        if (sep > 0 && sep < klen)
+        {
+            std::string dbname(kstr, sep);
+            if (seen_dbs.insert(dbname).second)
+            {
+                /* Build database directory path */
+                char db_dir[FN_REFLEN];
+                size_t dh_len = strlen(mysql_real_data_home);
+                snprintf(db_dir, sizeof(db_dir), "%s%s%s", mysql_real_data_home,
+                         (dh_len > 0 && mysql_real_data_home[dh_len - 1] != '/') ? "/" : "",
+                         dbname.c_str());
+
+                MY_STAT st;
+                if (!my_stat(db_dir, &st, MYF(0)))
+                {
+                    if (my_mkdir(db_dir, 0755, MYF(0)) == 0)
+                        sql_print_information(
+                            "TIDESDB: Created database directory '%s' for schema discovery",
+                            dbname.c_str());
+                }
+            }
+        }
+
+        tidesdb_iter_next(iter);
+    }
+
+    tidesdb_iter_free(iter);
+    tidesdb_txn_rollback(txn);
+    tidesdb_txn_free(txn);
+}
+
 /* ******************** Plugin init / deinit ******************** */
 
 static int tidesdb_hton_drop_table(handlerton *, const char *path);
@@ -2812,6 +2882,11 @@ static int tidesdb_init_func(void *p)
             tidesdb_hton->discover_table = tidesdb_discover_table;
             tidesdb_hton->discover_table_names = tidesdb_discover_table_names;
             tidesdb_hton->discover_table_existence = tidesdb_discover_table_existence;
+
+            /* Ensure database directories exist for all tables in the schema
+               CF so MariaDB discovers them (relevant for replicas). */
+            schema_cf_ensure_databases();
+
             sql_print_information("TIDESDB: Schema discovery enabled (object store mode)");
         }
     }
