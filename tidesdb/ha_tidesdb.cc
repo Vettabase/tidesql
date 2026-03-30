@@ -2421,40 +2421,52 @@ static std::string schema_cf_key_from_path(const char *path)
 }
 
 /*
-  Read the .frm file for a table and store it in the schema CF.
-  Called on CREATE TABLE, ALTER TABLE (commit), and RENAME TABLE.
+  Store a .frm image in the schema CF.
+
+  When frm_data/frm_len are provided the image is used directly (this is
+  the normal path during CREATE TABLE -- MariaDB skips writing .frm to
+  disk when discover_table is registered on the handlerton).
+
+  When frm_data is NULL, the .frm is read from disk (ALTER TABLE path
+  where MariaDB writes the updated .frm before calling commit).
+
   No-op when schema_cf is NULL (local-only mode).
 */
-static int schema_cf_store_frm(const char *path)
+static int schema_cf_store_frm(const char *path, const uchar *frm_data = NULL, size_t frm_len = 0)
 {
     if (!schema_cf) return 0;
 
-    /* Build .frm file path: path + ".frm" */
-    char frm_path[FN_REFLEN];
-    fn_format(frm_path, path, "", reg_ext, MY_UNPACK_FILENAME | MY_APPEND_EXT);
+    uchar *alloc_buf = NULL;
 
-    /* Read .frm from disk using MariaDB file I/O */
-    MY_STAT st;
-    if (!my_stat(frm_path, &st, MYF(0))) return 0; /* .frm not yet written -- not fatal */
-
-    File fd = my_open(frm_path, O_RDONLY, MYF(0));
-    if (fd < 0) return 0;
-
-    size_t frm_len = (size_t)st.st_size;
-    uchar *frm_data = (uchar *)my_malloc(PSI_NOT_INSTRUMENTED, frm_len, MYF(0));
     if (!frm_data)
     {
-        my_close(fd, MYF(0));
-        return -1;
-    }
+        /* Read .frm from disk as fallback */
+        char frm_path[FN_REFLEN];
+        fn_format(frm_path, path, "", reg_ext, MY_UNPACK_FILENAME | MY_APPEND_EXT);
 
-    if (my_read(fd, frm_data, frm_len, MYF(MY_NABP)) != 0)
-    {
-        my_free(frm_data);
+        MY_STAT st;
+        if (!my_stat(frm_path, &st, MYF(0))) return 0; /* .frm not on disk -- not fatal */
+
+        File fd = my_open(frm_path, O_RDONLY, MYF(0));
+        if (fd < 0) return 0;
+
+        frm_len = (size_t)st.st_size;
+        alloc_buf = (uchar *)my_malloc(PSI_NOT_INSTRUMENTED, frm_len, MYF(0));
+        if (!alloc_buf)
+        {
+            my_close(fd, MYF(0));
+            return -1;
+        }
+
+        if (my_read(fd, alloc_buf, frm_len, MYF(MY_NABP)) != 0)
+        {
+            my_free(alloc_buf);
+            my_close(fd, MYF(0));
+            return 0;
+        }
         my_close(fd, MYF(0));
-        return 0;
+        frm_data = alloc_buf;
     }
-    my_close(fd, MYF(0));
 
     std::string key = schema_cf_key_from_path(path);
 
@@ -2472,7 +2484,7 @@ static int schema_cf_store_frm(const char *path)
         tidesdb_txn_free(txn);
     }
 
-    my_free(frm_data);
+    if (alloc_buf) my_free(alloc_buf);
     return (rc == TDB_SUCCESS) ? 0 : -1;
 }
 
@@ -3754,8 +3766,13 @@ int ha_tidesdb::create(const char *name, TABLE *table_arg, HA_CREATE_INFO *creat
         }
     }
 
-    /* Store .frm in schema CF for object store discovery */
-    schema_cf_store_frm(name);
+    /* Store .frm in schema CF for object store discovery.
+       When discover_table is registered, MariaDB skips writing .frm to disk
+       and provides it via TABLE_SHARE::frm_image instead. */
+    if (table_arg->s->frm_image)
+        schema_cf_store_frm(name, table_arg->s->frm_image->str, table_arg->s->frm_image->length);
+    else
+        schema_cf_store_frm(name);
 
     DBUG_RETURN(0);
 }
@@ -7594,9 +7611,14 @@ bool ha_tidesdb::commit_inplace_alter_table(TABLE *altered_table, Alter_inplace_
     share->stats_refresh_us.store(0, std::memory_order_relaxed);
     unlock_shared_ha_data();
 
-    /* Update .frm in schema CF after ALTER (MariaDB writes the new .frm
-       before calling commit_inplace, so the disk copy is fresh). */
-    schema_cf_store_frm(table->s->path.str);
+    /* Update .frm in schema CF after ALTER.  When discover_table is
+       registered MariaDB may skip writing .frm to disk, so prefer the
+       in-memory image from the altered TABLE_SHARE. */
+    if (altered_table->s->frm_image)
+        schema_cf_store_frm(table->s->path.str, altered_table->s->frm_image->str,
+                            altered_table->s->frm_image->length);
+    else
+        schema_cf_store_frm(table->s->path.str);
 
     DBUG_RETURN(false);
 }
