@@ -41,6 +41,9 @@ static constexpr uint8_t KEY_NS_DATA = 0x01;
 /* CF naming */
 static constexpr const char CF_INDEX_INFIX[] = "__idx_";
 
+/* Reserved CF for schema discovery (object store mode only) */
+static constexpr const char SCHEMA_CF_NAME[] = "__tidesql_schema";
+
 /* Hidden primary key size (tables without explicit PK) */
 static constexpr size_t HIDDEN_PK_SIZE = sizeof(uint64_t);
 

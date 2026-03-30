@@ -115,6 +115,9 @@ extern MYSQL_PLUGIN_IMPORT char mysql_real_data_home[];
 static tidesdb_t *tdb_global = NULL;
 static std::string tdb_path;
 
+/* Schema discovery CF for object store mode (NULL when local-only) */
+static tidesdb_column_family_t *schema_cf = NULL;
+
 static handlerton *tidesdb_hton;
 
 /* ******************** Plugin-level row lock table ******************** */
@@ -2359,6 +2362,287 @@ static bool tidesdb_show_status(handlerton *hton, THD *thd, stat_print_fn *print
     return print(thd, "TIDESDB", 7, "", 0, buf, (size_t)pos);
 }
 
+/* ******************** Schema discovery (object store mode) ******************** */
+/*
+  The __tidesql_schema column family stores .frm binaries so that replicas
+  can discover table definitions via the handlerton discovery API.  On
+  local-only mode schema_cf is NULL and all helpers are no-ops.
+*/
+
+/*
+  Build a schema CF key from db + table LEX_CSTRINGs.
+  Format: "db_name\0table_name" (null byte separator, no trailing null).
+*/
+static std::string schema_cf_key(const LEX_CSTRING &db, const LEX_CSTRING &tbl)
+{
+    std::string k;
+    k.reserve(db.length + 1 + tbl.length);
+    k.append(db.str, db.length);
+    k.push_back('\0');
+    k.append(tbl.str, tbl.length);
+    return k;
+}
+
+/*
+  Build a schema CF key from a MariaDB table path (e.g. "./db/table").
+  Extracts the db and table components using the same logic as path_to_cf_name.
+*/
+static std::string schema_cf_key_from_path(const char *path)
+{
+    std::string p(path);
+
+    if (p.size() >= 2 && p[0] == '.' && p[1] == '/') p = p.substr(2);
+
+    size_t last_slash = p.rfind('/');
+    if (last_slash == std::string::npos)
+    {
+        /* No slashes -- treat entire path as table name with empty db */
+        std::string k;
+        k.push_back('\0');
+        k.append(p);
+        return k;
+    }
+
+    std::string tblname = p.substr(last_slash + 1);
+
+    size_t prev_slash = (last_slash > 0) ? p.rfind('/', last_slash - 1) : std::string::npos;
+    std::string dbname;
+    if (prev_slash == std::string::npos)
+        dbname = p.substr(0, last_slash);
+    else
+        dbname = p.substr(prev_slash + 1, last_slash - prev_slash - 1);
+
+    std::string k;
+    k.reserve(dbname.size() + 1 + tblname.size());
+    k.append(dbname);
+    k.push_back('\0');
+    k.append(tblname);
+    return k;
+}
+
+/*
+  Read the .frm file for a table and store it in the schema CF.
+  Called on CREATE TABLE, ALTER TABLE (commit), and RENAME TABLE.
+  No-op when schema_cf is NULL (local-only mode).
+*/
+static int schema_cf_store_frm(const char *path)
+{
+    if (!schema_cf) return 0;
+
+    /* Build .frm file path: path + ".frm" */
+    char frm_path[FN_REFLEN];
+    fn_format(frm_path, path, "", reg_ext, MY_UNPACK_FILENAME | MY_APPEND_EXT);
+
+    /* Read .frm from disk using MariaDB file I/O */
+    MY_STAT st;
+    if (!my_stat(frm_path, &st, MYF(0))) return 0; /* .frm not yet written -- not fatal */
+
+    File fd = my_open(frm_path, O_RDONLY, MYF(0));
+    if (fd < 0) return 0;
+
+    size_t frm_len = (size_t)st.st_size;
+    uchar *frm_data = (uchar *)my_malloc(PSI_NOT_INSTRUMENTED, frm_len, MYF(0));
+    if (!frm_data)
+    {
+        my_close(fd, MYF(0));
+        return -1;
+    }
+
+    if (my_read(fd, frm_data, frm_len, MYF(MY_NABP)) != 0)
+    {
+        my_free(frm_data);
+        my_close(fd, MYF(0));
+        return 0;
+    }
+    my_close(fd, MYF(0));
+
+    std::string key = schema_cf_key_from_path(path);
+
+    /* Write to schema CF using a dedicated one-shot transaction */
+    tidesdb_txn_t *txn = NULL;
+    int rc = tidesdb_txn_begin(tdb_global, &txn);
+    if (rc == TDB_SUCCESS)
+    {
+        rc = tidesdb_txn_put(txn, schema_cf, (const uint8_t *)key.data(), key.size(), frm_data,
+                             frm_len, TIDESDB_TTL_NONE);
+        if (rc == TDB_SUCCESS)
+            rc = tidesdb_txn_commit(txn);
+        else
+            tidesdb_txn_rollback(txn);
+        tidesdb_txn_free(txn);
+    }
+
+    my_free(frm_data);
+    return (rc == TDB_SUCCESS) ? 0 : -1;
+}
+
+/*
+  Remove a table's .frm entry from the schema CF on DROP TABLE.
+*/
+static void schema_cf_delete(const char *path)
+{
+    if (!schema_cf) return;
+
+    std::string key = schema_cf_key_from_path(path);
+    tidesdb_txn_t *txn = NULL;
+    if (tidesdb_txn_begin(tdb_global, &txn) == TDB_SUCCESS)
+    {
+        tidesdb_txn_delete(txn, schema_cf, (const uint8_t *)key.data(), key.size());
+        tidesdb_txn_commit(txn);
+        tidesdb_txn_free(txn);
+    }
+}
+
+/*
+  Rename a table's schema CF entry (delete old key, insert under new key).
+  Called from rename_table().
+*/
+static void schema_cf_rename(const char *from, const char *to)
+{
+    if (!schema_cf) return;
+
+    std::string old_key = schema_cf_key_from_path(from);
+    std::string new_key = schema_cf_key_from_path(to);
+
+    tidesdb_txn_t *txn = NULL;
+    if (tidesdb_txn_begin(tdb_global, &txn) != TDB_SUCCESS) return;
+
+    /* Read existing .frm from old key */
+    uint8_t *val = NULL;
+    size_t val_len = 0;
+    int rc = tidesdb_txn_get(txn, schema_cf, (const uint8_t *)old_key.data(), old_key.size(), &val,
+                             &val_len);
+    if (rc == TDB_SUCCESS && val)
+    {
+        /* Write under new key */
+        tidesdb_txn_put(txn, schema_cf, (const uint8_t *)new_key.data(), new_key.size(), val,
+                        val_len, TIDESDB_TTL_NONE);
+        /* Delete old key */
+        tidesdb_txn_delete(txn, schema_cf, (const uint8_t *)old_key.data(), old_key.size());
+        tidesdb_txn_commit(txn);
+        free(val);
+    }
+    else
+    {
+        tidesdb_txn_rollback(txn);
+        if (val) free(val);
+
+        /* Fallback: old key missing -- read .frm from disk at new path */
+        schema_cf_store_frm(to);
+    }
+
+    tidesdb_txn_free(txn);
+}
+
+/*
+  Handlerton discover_table callback.
+  Called when MariaDB cannot find a .frm file on disk for a TidesDB table.
+  Reads the .frm binary from the schema CF and initializes the TABLE_SHARE.
+*/
+static int tidesdb_discover_table(handlerton *, THD *thd, TABLE_SHARE *share)
+{
+    if (!schema_cf) return HA_ERR_NO_SUCH_TABLE;
+
+    std::string key = schema_cf_key(share->db, share->table_name);
+
+    tidesdb_txn_t *txn = NULL;
+    int rc = tidesdb_txn_begin(tdb_global, &txn);
+    if (rc != TDB_SUCCESS) return HA_ERR_NO_SUCH_TABLE;
+
+    uint8_t *val = NULL;
+    size_t val_len = 0;
+    rc = tidesdb_txn_get(txn, schema_cf, (const uint8_t *)key.data(), key.size(), &val, &val_len);
+    tidesdb_txn_rollback(txn); /* read-only, no commit needed */
+    tidesdb_txn_free(txn);
+
+    if (rc != TDB_SUCCESS || !val) return HA_ERR_NO_SUCH_TABLE;
+
+    /* Parse .frm binary into TABLE_SHARE.
+       write=true causes MariaDB to cache the .frm on disk so subsequent
+       opens skip discovery. */
+    rc = share->init_from_binary_frm_image(thd, true, val, val_len);
+
+    free(val);
+    return rc;
+}
+
+/*
+  Handlerton discover_table_names callback.
+  Lists all TidesDB tables in a given database by scanning the schema CF
+  for keys with the matching "db\0" prefix.
+*/
+static int tidesdb_discover_table_names(handlerton *, const LEX_CSTRING *db, MY_DIR *,
+                                        handlerton::discovered_list *result)
+{
+    if (!schema_cf) return 0;
+
+    /* Build prefix: "db_name\0" */
+    std::string prefix;
+    prefix.reserve(db->length + 1);
+    prefix.append(db->str, db->length);
+    prefix.push_back('\0');
+
+    tidesdb_txn_t *txn = NULL;
+    if (tidesdb_txn_begin(tdb_global, &txn) != TDB_SUCCESS) return 0;
+
+    tidesdb_iter_t *iter = NULL;
+    if (tidesdb_iter_new(txn, schema_cf, &iter) != TDB_SUCCESS || !iter)
+    {
+        tidesdb_txn_rollback(txn);
+        tidesdb_txn_free(txn);
+        return 0;
+    }
+
+    tidesdb_iter_seek(iter, (const uint8_t *)prefix.data(), prefix.size());
+    while (tidesdb_iter_valid(iter))
+    {
+        uint8_t *kp = NULL;
+        size_t klen = 0;
+        if (tidesdb_iter_key(iter, &kp, &klen) != TDB_SUCCESS || !kp) break;
+
+        /* Stop when prefix no longer matches */
+        if (klen < prefix.size() || memcmp(kp, prefix.data(), prefix.size()) != 0) break;
+
+        /* Table name is everything after the "db\0" prefix */
+        const char *tname = (const char *)kp + prefix.size();
+        size_t tlen = klen - prefix.size();
+        result->add_table(tname, tlen);
+
+        tidesdb_iter_next(iter);
+    }
+
+    tidesdb_iter_free(iter);
+    tidesdb_txn_rollback(txn);
+    tidesdb_txn_free(txn);
+    return 0;
+}
+
+/*
+  Handlerton discover_table_existence callback.
+  Returns 1 if the table has an entry in the schema CF, 0 otherwise.
+*/
+static int tidesdb_discover_table_existence(handlerton *, const char *db, const char *table_name)
+{
+    if (!schema_cf) return 0;
+
+    LEX_CSTRING db_lex = {db, strlen(db)};
+    LEX_CSTRING tbl_lex = {table_name, strlen(table_name)};
+    std::string key = schema_cf_key(db_lex, tbl_lex);
+
+    tidesdb_txn_t *txn = NULL;
+    if (tidesdb_txn_begin(tdb_global, &txn) != TDB_SUCCESS) return 0;
+
+    uint8_t *val = NULL;
+    size_t val_len = 0;
+    int rc =
+        tidesdb_txn_get(txn, schema_cf, (const uint8_t *)key.data(), key.size(), &val, &val_len);
+    tidesdb_txn_rollback(txn);
+    tidesdb_txn_free(txn);
+    if (val) free(val);
+
+    return (rc == TDB_SUCCESS) ? 1 : 0;
+}
+
 /* ******************** Plugin init / deinit ******************** */
 
 static int tidesdb_hton_drop_table(handlerton *, const char *path);
@@ -2501,12 +2785,33 @@ static int tidesdb_init_func(void *p)
 
     sql_print_information("TIDESDB: TidesDB opened at %s", tdb_path.c_str());
 
+    /* Schema discovery CF -- created when object store is active so that
+       replicas can discover table definitions from the shared storage. */
+    if (objstore_connector)
+    {
+        tidesdb_column_family_config_t schema_cfg = tidesdb_default_column_family_config();
+        if (!tidesdb_get_column_family(tdb_global, SCHEMA_CF_NAME))
+            tidesdb_create_column_family(tdb_global, SCHEMA_CF_NAME, &schema_cfg);
+
+        schema_cf = tidesdb_get_column_family(tdb_global, SCHEMA_CF_NAME);
+
+        if (schema_cf)
+        {
+            tidesdb_hton->discover_table = tidesdb_discover_table;
+            tidesdb_hton->discover_table_names = tidesdb_discover_table_names;
+            tidesdb_hton->discover_table_existence = tidesdb_discover_table_existence;
+            sql_print_information("TIDESDB: Schema discovery enabled (object store mode)");
+        }
+    }
+
     DBUG_RETURN(0);
 }
 
 static int tidesdb_deinit_func(void *p)
 {
     DBUG_ENTER("tidesdb_deinit_func");
+
+    schema_cf = NULL;
 
     if (tdb_global)
     {
@@ -3448,6 +3753,9 @@ int ha_tidesdb::create(const char *name, TABLE *table_arg, HA_CREATE_INFO *creat
             }
         }
     }
+
+    /* Store .frm in schema CF for object store discovery */
+    schema_cf_store_frm(name);
 
     DBUG_RETURN(0);
 }
@@ -7286,6 +7594,10 @@ bool ha_tidesdb::commit_inplace_alter_table(TABLE *altered_table, Alter_inplace_
     share->stats_refresh_us.store(0, std::memory_order_relaxed);
     unlock_shared_ha_data();
 
+    /* Update .frm in schema CF after ALTER (MariaDB writes the new .frm
+       before calling commit_inplace, so the disk copy is fresh). */
+    schema_cf_store_frm(table->s->path.str);
+
     DBUG_RETURN(false);
 }
 
@@ -7350,6 +7662,9 @@ int ha_tidesdb::rename_table(const char *from, const char *to)
             free(names);
         }
     }
+
+    /* Update schema CF entry for the renamed table */
+    schema_cf_rename(from, to);
 
     DBUG_RETURN(0);
 }
@@ -7428,6 +7743,9 @@ static int tidesdb_drop_table_impl(const char *path)
        with overlapping keys (bloom filters useless). */
     force_remove_cf_dir(cf_name);
     for (const auto &idx_name : idx_cf_names) force_remove_cf_dir(idx_name);
+
+    /* Remove .frm from schema CF */
+    schema_cf_delete(path);
 
     return 0;
 }
