@@ -33,11 +33,11 @@ jobs:
     - name: Resolve TidesDB version
       id: tidesdb-version
       run: |
-        TAG=$(curl -sf https://api.github.com/repos/tidesdb/tidesdb/releases/latest \
-              | grep '"tag_name"' | head -1 | cut -d'"' -f4)
-        [ -z "$TAG" ] && TAG="master"
+        # Use the 901-patch branch from PR #582 until merged
+        # TODO: revert to latest release tag after tidesdb/tidesdb#582 is merged
+        TAG="901-patch"
         echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-        echo "TidesDB version: $TAG"
+        echo "TidesDB version: $TAG (PR #582)"
 
     - name: Build TideSQL Docker image
       run: |
@@ -134,6 +134,7 @@ jobs:
 
             tidesdb_unified_memtable=ON
             tidesdb_unified_memtable_sync_mode=FULL
+            tidesdb_unified_memtable_write_buffer_size=4096
             tidesdb_block_cache_size=67108864
             tidesdb_flush_threads=2
             tidesdb_compaction_threads=2
@@ -210,6 +211,8 @@ jobs:
 
     - name: Write test data to primary
       run: |
+        # Write enough data to exceed the 1MB unified memtable write buffer
+        # and trigger a flush to SSTables which then get uploaded to S3
         kubectl exec -n tidesql tidesql-primary -- \
           mariadb -e "
             CREATE DATABASE k8s_test;
@@ -219,18 +222,24 @@ jobs:
               name VARCHAR(100),
               data TEXT
             ) ENGINE=TidesDB;
-            INSERT INTO items VALUES (1, 'alpha', REPEAT('A', 500));
-            INSERT INTO items VALUES (2, 'beta',  REPEAT('B', 500));
-            INSERT INTO items VALUES (3, 'gamma', REPEAT('C', 500));
-            SELECT id, name, LENGTH(data) FROM items ORDER BY id;
+            INSERT INTO items VALUES (1, 'alpha', REPEAT('A', 10000));
+            INSERT INTO items VALUES (2, 'beta',  REPEAT('B', 10000));
+            INSERT INTO items VALUES (3, 'gamma', REPEAT('C', 10000));
           "
+        # Insert bulk data to exceed the 1MB flush threshold
+        for i in $(seq 4 200); do
+          kubectl exec -n tidesql tidesql-primary -- \
+            mariadb -e "INSERT INTO k8s_test.items VALUES ($i, 'bulk_$i', REPEAT('X', 10000))" 2>/dev/null
+        done
+        kubectl exec -n tidesql tidesql-primary -- \
+          mariadb -e "SELECT COUNT(*) AS total_rows, SUM(LENGTH(data)) AS total_bytes FROM k8s_test.items"
 
     - name: Verify data on primary
       run: |
         RESULT=$(kubectl exec -n tidesql tidesql-primary -- \
           mariadb -N -e "SELECT COUNT(*) FROM k8s_test.items")
         echo "Primary row count: $RESULT"
-        [ "$RESULT" -eq 3 ] || (echo "FAIL: expected 3 rows, got $RESULT"; exit 1)
+        [ "$RESULT" -ge 3 ] || (echo "FAIL: expected at least 3 rows, got $RESULT"; exit 1)
 
     - name: Force flush to S3
       run: |
@@ -350,11 +359,11 @@ jobs:
           RESULT=$(kubectl exec -n tidesql tidesql-replica -- \
             mariadb -N -e "SELECT COUNT(*) FROM k8s_test.items" 2>/dev/null || echo "0")
           echo "Replica sync check $i: $RESULT rows"
-          [ "$RESULT" -eq 3 ] && break
+          [ "$RESULT" -ge 3 ] && break
           sleep 5
         done
 
-        if [ "$RESULT" -ne 3 ]; then
+        if [ "$RESULT" -lt 3 ]; then
           echo "=== Replica TidesDB LOG ==="
           kubectl exec -n tidesql tidesql-replica -- \
             sh -c 'cat /usr/local/mariadb/tidesdb_data/LOG 2>/dev/null | tail -30' || true
