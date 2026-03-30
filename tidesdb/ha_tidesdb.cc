@@ -2371,7 +2371,7 @@ static bool tidesdb_show_status(handlerton *hton, THD *thd, stat_print_fn *print
 
 /*
   Build a schema CF key from db + table LEX_CSTRINGs.
-  Format: "db_name\0table_name" (null byte separator, no trailing null).
+  Format-- "db_name\0table_name" (null byte separator, no trailing null).
 */
 static std::string schema_cf_key(const LEX_CSTRING &db, const LEX_CSTRING &tbl)
 {
@@ -2539,7 +2539,7 @@ static void schema_cf_rename(const char *from, const char *to)
         tidesdb_txn_rollback(txn);
         if (val) free(val);
 
-        /* Fallback: old key missing -- read .frm from disk at new path */
+        /* Fallback-- old key missing -- read .frm from disk at new path */
         schema_cf_store_frm(to);
     }
 
@@ -2569,6 +2569,22 @@ static int tidesdb_discover_table(handlerton *, THD *thd, TABLE_SHARE *share)
 
     if (rc != TDB_SUCCESS || !val) return HA_ERR_NO_SUCH_TABLE;
 
+    /* Verify the data CF actually exists before returning the .frm.
+       If the .frm is in the schema CF but the data CF hasn't been synced
+       yet (e.g. replica hasn't downloaded it from S3), returning the .frm
+       would cause handler::open() to fail with HA_ERR_NO_SUCH_TABLE.
+       MariaDB then retries discovery in an infinite loop (delete .frm ->
+       discover -> write .frm -> open fails -> delete .frm -> ...). */
+    {
+        std::string cf_name = std::string(share->db.str, share->db.length) + "__" +
+                              std::string(share->table_name.str, share->table_name.length);
+        if (!tidesdb_get_column_family(tdb_global, cf_name.c_str()))
+        {
+            free(val);
+            return HA_ERR_NO_SUCH_TABLE;
+        }
+    }
+
     /* Parse .frm binary into TABLE_SHARE.
        write=true causes MariaDB to cache the .frm on disk so subsequent
        opens skip discovery. */
@@ -2588,7 +2604,7 @@ static int tidesdb_discover_table_names(handlerton *, const LEX_CSTRING *db, MY_
 {
     if (!schema_cf) return 0;
 
-    /* Build prefix: "db_name\0" */
+    /* Build prefix-- "db_name\0" */
     std::string prefix;
     prefix.reserve(db->length + 1);
     prefix.append(db->str, db->length);
@@ -2687,7 +2703,7 @@ static void schema_cf_ensure_databases()
         size_t klen = 0;
         if (tidesdb_iter_key(iter, &kp, &klen) != TDB_SUCCESS || !kp) break;
 
-        /* Key format: "db_name\0table_name" — find the null separator */
+        /* Key format-- "db_name\0table_name" -- find the null separator */
         const char *kstr = (const char *)kp;
         size_t sep = 0;
         for (; sep < klen; sep++)
@@ -6689,7 +6705,7 @@ FT_INFO *ha_tidesdb::ft_init_ext(uint flags, uint inx, String *key)
     {
         if (qt.yesno > 0) num_required++;
 
-        /* We build prefix key: [2-byte term_len][term bytes] */
+        /* We build prefix key-- [2-byte term_len][term bytes] */
         uchar prefix[2 + FTS_MAX_TERM_BYTES];
         uint prefix_len = 0;
         int2store(prefix, (uint16)qt.term.size());

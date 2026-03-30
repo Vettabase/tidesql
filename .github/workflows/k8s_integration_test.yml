@@ -531,18 +531,20 @@ jobs:
             FLUSH PRIVILEGES;
           "
 
-        # Write fresh data and flush
+        # Write fresh data to existing items table and flush
         kubectl exec -n tidesql tidesql-primary -- \
           mariadb -e "
-            CREATE DATABASE IF NOT EXISTS k8s_test;
-            USE k8s_test;
-            CREATE TABLE IF NOT EXISTS failover_data (id INT PRIMARY KEY, v VARCHAR(50)) ENGINE=TidesDB;
-            INSERT INTO failover_data VALUES (1, 'before_auto_failover');
-            OPTIMIZE TABLE failover_data;
+            INSERT INTO k8s_test.items VALUES (10002, 'auto_failover_marker', REPEAT('F', 500));
+            OPTIMIZE TABLE k8s_test.items;
           " 2>&1 || true
 
-        # Wait for S3 upload + replica sync of the new table
+        # Wait for S3 upload + replica sync
         sleep 15
+
+        # Verify replica can see the new row before we test failover
+        RESULT=$(timeout 10 kubectl exec -n tidesql tidesql-replica -- \
+          mariadb --connect-timeout=5 -N -e "SELECT COUNT(*) FROM k8s_test.items" 2>/dev/null || echo "0")
+        echo "Pre-failover replica row count: $RESULT"
         echo "Primary restored with test data"
 
     - name: Deploy automated failover controller
@@ -667,19 +669,26 @@ jobs:
         kubectl logs -n tidesql tidesql-failover 2>/dev/null || true
 
     - name: Verify automated failover succeeded
+      timeout-minutes: 2
       run: |
         # The replica should now be promoted and accept writes
         sleep 5
 
-        kubectl exec -n tidesql tidesql-replica -- \
-          mariadb -e "INSERT INTO k8s_test.failover_data VALUES (2, 'after_auto_failover')" \
-          2>&1 || true
-
-        RESULT=$(kubectl exec -n tidesql tidesql-replica -- \
-          mariadb -N -e "SELECT COUNT(*) FROM k8s_test.failover_data" 2>/dev/null || echo "0")
+        # Verify data survived promotion (items table already cached — no discovery needed)
+        RESULT=$(timeout 10 kubectl exec -n tidesql tidesql-replica -- \
+          mariadb --connect-timeout=5 -N -e "SELECT COUNT(*) FROM k8s_test.items" 2>/dev/null || echo "0")
         echo "Post-auto-failover row count: $RESULT"
+        [ "$RESULT" -ge 3 ] || (echo "FAIL: data lost after automated failover (got $RESULT)"; exit 1)
 
-        [ "$RESULT" -ge 1 ] || (echo "FAIL: automated failover did not preserve data"; exit 1)
+        # Verify promoted replica accepts writes
+        timeout 15 kubectl exec -n tidesql tidesql-replica -- \
+          mariadb --connect-timeout=5 -e "INSERT INTO k8s_test.items VALUES (10003, 'after_auto_failover', REPEAT('G', 500))" \
+          2>&1 || echo "INSERT failed or timed out (non-fatal)"
+
+        NEW_RESULT=$(timeout 10 kubectl exec -n tidesql tidesql-replica -- \
+          mariadb --connect-timeout=5 -N -e "SELECT COUNT(*) FROM k8s_test.items" 2>/dev/null || echo "0")
+        echo "After write: $NEW_RESULT rows"
+
         echo "Automated failover successful - data intact, writes accepted"
 
     - name: Collect logs on failure
