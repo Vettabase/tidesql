@@ -188,6 +188,18 @@ jobs:
         echo "Waiting for primary..."
         kubectl wait -n tidesql --for=condition=Ready pod/tidesql-primary --timeout=120s
 
+    - name: Create monitor user for remote access
+      run: |
+        # MariaDB root is unix_socket only (localhost). Create a user that
+        # the failover controller (a separate pod) can use over TCP.
+        kubectl exec -n tidesql tidesql-primary -- \
+          mariadb -e "
+            CREATE USER IF NOT EXISTS 'monitor'@'%' IDENTIFIED BY 'monitor';
+            GRANT ALL PRIVILEGES ON *.* TO 'monitor'@'%' WITH GRANT OPTION;
+            FLUSH PRIVILEGES;
+          "
+        echo "Monitor user created on primary"
+
     - name: Verify S3 config is loaded
       run: |
         echo "=== Config file injected into primary ==="
@@ -340,6 +352,15 @@ jobs:
         echo "Waiting for replica..."
         kubectl wait -n tidesql --for=condition=Ready pod/tidesql-replica --timeout=120s
 
+        # Create monitor user on replica for failover controller access
+        kubectl exec -n tidesql tidesql-replica -- \
+          mariadb -e "
+            CREATE USER IF NOT EXISTS 'monitor'@'%' IDENTIFIED BY 'monitor';
+            GRANT ALL PRIVILEGES ON *.* TO 'monitor'@'%' WITH GRANT OPTION;
+            FLUSH PRIVILEGES;
+          "
+        echo "Monitor user created on replica"
+
     - name: Wait for replica sync
       run: |
         echo "Waiting for replica to sync from S3..."
@@ -366,7 +387,7 @@ jobs:
         if [ "$RESULT" -lt 3 ]; then
           echo "=== Replica TidesDB LOG ==="
           kubectl exec -n tidesql tidesql-replica -- \
-            sh -c 'cat /usr/local/mariadb/tidesdb_data/LOG 2>/dev/null | tail -30' || true
+            sh -c 'cat /usr/local/mariadb/data/tidesdb_data/LOG 2>/dev/null | tail -30' || true
           echo "FAIL: replica did not sync (got $RESULT rows)"
           exit 1
         fi
@@ -389,7 +410,7 @@ jobs:
     - name: Verify replica rejects writes
       run: |
         kubectl exec -n tidesql tidesql-replica -- \
-          mariadb -e "INSERT INTO k8s_test.items VALUES (99, 'should_fail', 'x')" 2>&1 \
+          mariadb -e "INSERT INTO k8s_test.items VALUES (99999, 'should_fail', 'x')" 2>&1 \
           | grep -q 'ERROR\|error\|read.only' && echo "PASS: replica correctly rejects writes" \
           || echo "WARNING: replica did not reject write (may not have read-only enforcement)"
 
@@ -405,9 +426,9 @@ jobs:
           mariadb -e "SET GLOBAL tidesdb_promote_primary = ON" 2>&1 || true
         sleep 5
 
-        # Verify promoted replica accepts writes
+        # Verify promoted replica accepts writes (use id that doesn't conflict)
         kubectl exec -n tidesql tidesql-replica -- \
-          mariadb -e "INSERT INTO k8s_test.items VALUES (4, 'manual_failover', REPEAT('D', 500))" \
+          mariadb -e "INSERT INTO k8s_test.items VALUES (10001, 'manual_failover', REPEAT('D', 500))" \
           2>&1 || true
 
         RESULT=$(kubectl exec -n tidesql tidesql-replica -- \
@@ -455,6 +476,14 @@ jobs:
 
         kubectl wait -n tidesql --for=condition=Ready pod/tidesql-primary --timeout=120s
 
+        # Create monitor user on new primary
+        kubectl exec -n tidesql tidesql-primary -- \
+          mariadb -e "
+            CREATE USER IF NOT EXISTS 'monitor'@'%' IDENTIFIED BY 'monitor';
+            GRANT ALL PRIVILEGES ON *.* TO 'monitor'@'%' WITH GRANT OPTION;
+            FLUSH PRIVILEGES;
+          "
+
         # Re-deploy a fresh replica (old one was promoted)
         kubectl delete pod -n tidesql tidesql-replica --grace-period=0 --force 2>/dev/null || true
         sleep 5
@@ -494,6 +523,14 @@ jobs:
 
         kubectl wait -n tidesql --for=condition=Ready pod/tidesql-replica --timeout=120s
 
+        # Create monitor user on fresh replica
+        kubectl exec -n tidesql tidesql-replica -- \
+          mariadb -e "
+            CREATE USER IF NOT EXISTS 'monitor'@'%' IDENTIFIED BY 'monitor';
+            GRANT ALL PRIVILEGES ON *.* TO 'monitor'@'%' WITH GRANT OPTION;
+            FLUSH PRIVILEGES;
+          "
+
         # Write fresh data and flush
         kubectl exec -n tidesql tidesql-primary -- \
           mariadb -e "
@@ -503,12 +540,14 @@ jobs:
             INSERT INTO failover_data VALUES (1, 'before_auto_failover');
             OPTIMIZE TABLE failover_data;
           " 2>&1 || true
-        sleep 10
+
+        # Wait for S3 upload + replica sync of the new table
+        sleep 15
         echo "Primary restored with test data"
 
     - name: Deploy automated failover controller
       run: |
-        # Deploy the failover controller from k8s/ manifests with test-friendly settings
+        # Deploy the failover controller using the monitor user for TCP access
         kubectl apply -n tidesql -f - <<'EOF'
         apiVersion: v1
         kind: ConfigMap
@@ -517,26 +556,26 @@ jobs:
         data:
           failover.sh: |
             #!/bin/bash
-            set -euo pipefail
+            set -uo pipefail
             PRIMARY_HOST="${PRIMARY_HOST:-tidesql-primary}"
             PRIMARY_PORT="${PRIMARY_PORT:-3306}"
             REPLICA_HOST="${REPLICA_HOST:-tidesql-replica}"
             REPLICA_PORT="${REPLICA_PORT:-3306}"
             CHECK_INTERVAL="${CHECK_INTERVAL:-3}"
             FAILURE_THRESHOLD="${FAILURE_THRESHOLD:-2}"
-            MYSQL_USER="${MYSQL_USER:-root}"
-            MYSQL_PASSWORD="${MYSQL_PASSWORD:-}"
+            MYSQL_USER="${MYSQL_USER:-monitor}"
+            MYSQL_PASSWORD="${MYSQL_PASSWORD:-monitor}"
             FAILURES=0
             log() { echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] $*"; }
             check_primary() {
                 mariadb -h "$PRIMARY_HOST" -P "$PRIMARY_PORT" \
-                        -u "$MYSQL_USER" ${MYSQL_PASSWORD:+-p"$MYSQL_PASSWORD"} \
+                        -u "$MYSQL_USER" -p"$MYSQL_PASSWORD" \
                         -e "SELECT 1" > /dev/null 2>&1
             }
             promote_replica() {
                 log "PROMOTING replica $REPLICA_HOST to primary"
                 mariadb -h "$REPLICA_HOST" -P "$REPLICA_PORT" \
-                        -u "$MYSQL_USER" ${MYSQL_PASSWORD:+-p"$MYSQL_PASSWORD"} \
+                        -u "$MYSQL_USER" -p"$MYSQL_PASSWORD" \
                         -e "SET GLOBAL tidesdb_promote_primary = ON" 2>&1
                 log "Promotion command sent"
             }
@@ -567,6 +606,7 @@ jobs:
           labels:
             app: tidesql-failover
         spec:
+          restartPolicy: Never
           containers:
           - name: controller
             image: mariadb:latest
@@ -580,6 +620,10 @@ jobs:
               value: "3"
             - name: FAILURE_THRESHOLD
               value: "2"
+            - name: MYSQL_USER
+              value: "monitor"
+            - name: MYSQL_PASSWORD
+              value: "monitor"
             volumeMounts:
             - name: scripts
               mountPath: /scripts
@@ -593,7 +637,7 @@ jobs:
         kubectl wait -n tidesql --for=condition=Ready pod/tidesql-failover --timeout=60s
         echo "Failover controller deployed"
 
-        # Verify it's running and checking the primary
+        # Verify it's running and can reach the primary
         sleep 5
         kubectl logs -n tidesql tidesql-failover --tail=5
 
