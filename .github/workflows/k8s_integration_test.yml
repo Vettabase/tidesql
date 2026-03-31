@@ -33,11 +33,14 @@ jobs:
     - name: Resolve TidesDB version
       id: tidesdb-version
       run: |
-        # Use the 901-patch branch from PR #582 until merged
-        # TODO: revert to latest release tag after tidesdb/tidesdb#582 is merged
-        TAG="901-patch"
+        # Resolve latest TidesDB release tag from GitHub
+        TAG=$(curl -sf https://api.github.com/repos/tidesdb/tidesdb/releases/latest | grep '"tag_name"' | head -1 | cut -d'"' -f4)
+        if [ -z "$TAG" ]; then
+          echo "Failed to resolve latest TidesDB release"
+          exit 1
+        fi
         echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-        echo "TidesDB version: $TAG (PR #582)"
+        echo "TidesDB version: $TAG"
 
     - name: Build TideSQL Docker image
       run: |
