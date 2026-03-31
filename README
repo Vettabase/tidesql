@@ -229,12 +229,20 @@ Core:
 - Hard-link checkpoint (SET GLOBAL tidesdb_checkpoint_dir = '/path')
 - OPTIMIZE TABLE (synchronous purge + compact via tidesdb_purge_cf)
 - SHOW ENGINE TIDESDB STATUS (DB stats, memory, cache, conflict info)
+- SHOW GLOBAL STATUS LIKE 'tidesdb%' (19 machine-readable status variables
+  for monitoring tools: Prometheus, PMM, Datadog, etc.)
 - Partitioning (RANGE, LIST, HASH, KEY)
 - Data-at-rest encryption (MariaDB encryption plugin integration)
 - Online DDL (instant metadata, inplace add/drop index, copy for columns)
 - TRUNCATE TABLE as O(1) drop+recreate (instant regardless of table size)
 - ANALYZE TABLE with detailed CF statistics (levels, keys, sizes, cache hit rate)
 - Cached optimizer statistics (refreshed every 2 seconds from TidesDB)
+- Full-text search (FULLTEXT indexes with BM25 ranking, natural language
+  and boolean mode, charset-aware tokenizer, configurable BM25 parameters)
+- Vector search (VECTOR indexes via MariaDB's MHNSW approximate nearest
+  neighbor, Euclidean and cosine distance, INSERT/UPDATE/DELETE support)
+- Spatial indexes (SPATIAL KEY with Hilbert curve encoding on LSM,
+  MBRIntersects/MBRContains/MBRWithin/MBREquals/MBRDisjoint predicates)
 
 Cloud / Object Store:
 - S3-compatible object store backend (AWS S3, MinIO, GCS)
@@ -303,6 +311,10 @@ Dynamic (SET GLOBAL at runtime):
                             TPC-C or workloads needing row-level serialization.
   promote_primary           Set to ON to promote a replica to primary
                             (trigger variable, resets to OFF after promotion)
+  fts_min_word_len          Minimum word length for FTS indexing (default: 3)
+  fts_max_word_len          Maximum word length for FTS indexing (default: 84)
+  fts_bm25_k1               BM25 k1 term-frequency saturation (default: 1.2)
+  fts_bm25_b                BM25 b document-length normalization (default: 0.75)
 
 Session (SET SESSION tidesdb_...):
 
@@ -395,23 +407,33 @@ Run specific test:
 
   perl mtr --suite=tidesdb tidesdb_crud
 
-Available tests (32 total):
+Available tests (46 total, 260+ cases):
   tidesdb_alter_crash         Crash safety during ALTER TABLE operations
   tidesdb_analyze             ANALYZE TABLE with CF statistics output
+  tidesdb_auto_increment      AUTO_INCREMENT edge cases (gaps, rollback, explicit values)
   tidesdb_backup              Online backup via tidesdb_backup_dir
   tidesdb_concurrent_conflict Concurrent write-write conflict handling
   tidesdb_concurrent_errors   Multi-connection error handling and recovery
+  tidesdb_checkpoint          Hard-link checkpoint via tidesdb_checkpoint_dir
   tidesdb_consistent_snapshot START TRANSACTION WITH CONSISTENT SNAPSHOT
   tidesdb_crud                Basic CRUD operations
   tidesdb_data_home_dir       tidesdb_data_home_dir sysvar
   tidesdb_drop_create         Repeated DROP/CREATE/TRUNCATE cycles
   tidesdb_encryption          Data-at-rest encryption
+  tidesdb_engine_convert      InnoDB <-> TidesDB engine migration (ALTER TABLE ENGINE)
   tidesdb_engine_status       SHOW ENGINE TIDESDB STATUS
+  tidesdb_fulltext            Full-text search (FULLTEXT indexes, BM25, boolean mode)
+  tidesdb_fulltext_phrase     FTS phrase queries ("exact phrase") and wildcard edge cases
+  tidesdb_hidden_pk           Tables without explicit PK (hidden auto-generated row ID)
   tidesdb_index_stats         Index statistics and optimizer cost model
   tidesdb_info_schema         information_schema integration
   tidesdb_insert_conflict     Duplicate key detection and handling
   tidesdb_isolation           Isolation level behavior
   tidesdb_json                JSON querying + generated-column JSON indexing
+  tidesdb_large_blob          Large BLOB/TEXT values (> 64KB, klog_value_threshold)
+  tidesdb_load_data           Bulk insert path (multi-row INSERT, INSERT...SELECT)
+  tidesdb_mixed_engine        Mixed-engine transactions (TidesDB + InnoDB in same txn)
+  tidesdb_object_store        Object store integration (CRUD, indexes, txns, bulk, compaction)
   tidesdb_online_ddl          Online DDL (instant, inplace, copy)
   tidesdb_options             Table and field options
   tidesdb_partition           RANGE/LIST/HASH/KEY partitioning
@@ -422,11 +444,15 @@ Available tests (32 total):
   tidesdb_rename              Table rename
   tidesdb_replace_iodku       REPLACE INTO and INSERT ON DUPLICATE KEY UPDATE
   tidesdb_savepoint           SQL SAVEPOINT / ROLLBACK TO / RELEASE SAVEPOINT
+  tidesdb_spatial             Spatial indexes (Hilbert curve, MBR predicates)
   tidesdb_sql                 40 SQL cases (aggregates, JOINs, subqueries, etc.)
+  tidesdb_status_vars         SHOW GLOBAL STATUS LIKE 'tidesdb%' monitoring variables
   tidesdb_stress              Concurrent transactions, conflicts, truncate cycles
   tidesdb_tpcc_contention     TPC-C district counter contention (pessimistic locking)
   tidesdb_ttl                 Time-to-live expiration
+  tidesdb_unified_memtable    Unified memtable mode (shared WAL, cross-CF consistency)
   tidesdb_vcol                Virtual/generated columns
+  tidesdb_vector              Vector search (MHNSW ANN, INSERT/UPDATE/DELETE)
   tidesdb_write_pressure          oltp_write_only pressure (multi-connection)
 
 Run with verbose output:
