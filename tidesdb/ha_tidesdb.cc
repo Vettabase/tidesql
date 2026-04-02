@@ -522,6 +522,50 @@ struct fts_token_t
 static ulong srv_fts_min_word_len = 3;
 static ulong srv_fts_max_word_len = 84;
 
+/* Blend characters -- characters that are indexed as both separators and valid
+   word characters.  When a blend char appears inside a token, the tokenizer
+   emits THREE tokens: the full blended form, and the two parts on each side.
+   For example, with blend_chars="'" and input "l'aria":
+     - "l'aria" (full blended token)
+     - "l"      (left part, may be filtered by min_word_len)
+     - "aria"   (right part)
+   This allows Italian/French elision (dell'aria, l'homme) and Irish/Scottish
+   names (O'Malley) to be searchable by any component or the full form.
+   Default is empty (no blend characters). Set to "'" for Romance languages. */
+static char *srv_fts_blend_chars = NULL;
+
+/* Fast lookup table for blend characters (ASCII range).
+   Rebuilt when the sysvar changes. */
+static bool tdb_blend_char_map[256] = {false};
+static mysql_rwlock_t tdb_blend_lock;
+static PSI_rwlock_key tdb_blend_lock_key;
+
+static void tdb_rebuild_blend_map(const char *chars)
+{
+    memset(tdb_blend_char_map, 0, sizeof(tdb_blend_char_map));
+    if (!chars) return;
+    for (const char *p = chars; *p; p++) tdb_blend_char_map[(unsigned char)*p] = true;
+}
+
+static inline bool tdb_is_blend_char(unsigned char c)
+{
+    return tdb_blend_char_map[c];
+}
+
+static void tdb_fts_blend_chars_update(MYSQL_THD thd, struct st_mysql_sys_var *var, void *var_ptr,
+                                       const void *save)
+{
+    const char *new_val = *static_cast<const char *const *>(save);
+    mysql_rwlock_wrlock(&tdb_blend_lock);
+    tdb_rebuild_blend_map(new_val);
+    mysql_rwlock_unlock(&tdb_blend_lock);
+    *static_cast<const char **>(var_ptr) = new_val;
+    if (new_val && new_val[0])
+        sql_print_information("TIDESDB: FTS blend_chars set to '%s'", new_val);
+    else
+        sql_print_information("TIDESDB: FTS blend_chars cleared");
+}
+
 /* ---- Stop word support ------------------------------------------------
    Mirrors InnoDB's innodb_ft_server_stopword_table.  When NULL, we use the
    36-word default list from information_schema.INNODB_FT_DEFAULT_STOPWORD.
@@ -724,11 +768,34 @@ static void tdb_ft_stopword_table_update(MYSQL_THD thd, struct st_mysql_sys_var 
 static double srv_fts_bm25_k1 = 1.2;
 static double srv_fts_bm25_b = 0.75;
 
-/* Charset-aware tokenizer.
+/* Helper to lowercase, check stop words, length filter, and emit a token */
+static inline void fts_emit_token(const char *word_start, size_t byte_len, uint char_count,
+                                  CHARSET_INFO *cs, std::vector<fts_token_t> &out)
+{
+    if (char_count < srv_fts_min_word_len || char_count > srv_fts_max_word_len) return;
+
+    fts_token_t tok;
+    tok.word.assign(word_start, byte_len);
+    size_t lowered_len =
+        cs->cset->casedn(cs, &tok.word[0], tok.word.size(), &tok.word[0], tok.word.size());
+    tok.word.resize(lowered_len);
+
+    if (tdb_is_stopword(tok.word)) return;
+    out.push_back(std::move(tok));
+}
+
+/* Charset-aware tokenizer with blend character support.
    Uses MariaDB's charset API to correctly handle multi-byte characters
    (UTF-8, UTF-16, CJK character sets, etc.).  Splits on word boundaries
    using the charset's ctype classification, lowercases using the charset's
-   case-folding tables, and filters by configurable word length bounds. */
+   case-folding tables, and filters by configurable word length bounds.
+
+   Blend characters (configured via tidesdb_fts_blend_chars) are treated as
+   both word characters and separators.  When a blend char appears inside a
+   token, the tokenizer emits three forms: the full blended token, and the
+   two parts on each side of the blend char.  This enables Romance language
+   elision (l'aria -> l'aria + aria) and names (O'Malley -> o'malley + malley)
+   to be searchable by any component or the full form. */
 static void fts_tokenize(const char *text, size_t text_len, CHARSET_INFO *cs,
                          std::vector<fts_token_t> &out)
 {
@@ -736,25 +803,35 @@ static void fts_tokenize(const char *text, size_t text_len, CHARSET_INFO *cs,
     const char *end = text + text_len;
     uint mblen;
 
+    /* We snapshot blend chars under read lock once per tokenize call */
+    bool has_blend = false;
+    bool blend_map_copy[256];
+    {
+        mysql_rwlock_rdlock(&tdb_blend_lock);
+        memcpy(blend_map_copy, tdb_blend_char_map, sizeof(blend_map_copy));
+        mysql_rwlock_unlock(&tdb_blend_lock);
+        for (int i = 0; i < 256 && !has_blend; i++)
+            if (blend_map_copy[i]) has_blend = true;
+    }
+
     while (p < end)
     {
-        /* We skip non-alphanumeric characters, respecting multi-byte boundaries */
+        /* We skip non-alphanumeric, non-blend characters */
         while (p < end)
         {
             mblen = my_ismbchar(cs, p, end);
-            if (mblen)
-            {
-                /* Multi-byte characters, we treat as word character (CJK, etc.) */
-                break;
-            }
+            if (mblen) break; /* multi-byte = word char */
             if (my_isalnum(cs, (uchar)*p)) break;
+            if (has_blend && blend_map_copy[(uchar)*p]) break;
             p++;
         }
         if (p >= end) break;
 
         const char *word_start = p;
         uint char_count = 0;
-        /* We collect word characters */
+        bool contains_blend = false;
+
+        /* We collect word characters including blend chars */
         while (p < end)
         {
             mblen = my_ismbchar(cs, p, end);
@@ -764,28 +841,56 @@ static void fts_tokenize(const char *text, size_t text_len, CHARSET_INFO *cs,
                 char_count++;
                 continue;
             }
-            if (!my_isalnum(cs, (uchar)*p)) break;
-            p++;
-            char_count++;
+            if (my_isalnum(cs, (uchar)*p))
+            {
+                p++;
+                char_count++;
+                continue;
+            }
+            if (has_blend && blend_map_copy[(uchar)*p])
+            {
+                contains_blend = true;
+                p++;
+                char_count++;
+                continue;
+            }
+            break;
         }
         size_t byte_len = (size_t)(p - word_start);
 
-        /* We filter by word length in characters (not bytes) */
-        if (char_count < srv_fts_min_word_len || char_count > srv_fts_max_word_len) continue;
+        if (!contains_blend)
+        {
+            /* No blend chars -- emit single token as before */
+            fts_emit_token(word_start, byte_len, char_count, cs, out);
+        }
+        else
+        {
+            /* Blend char found -- emit full blended token plus sub-parts.
+               We split on blend chars and emit each sub-part that meets
+               the minimum length requirement. */
+            fts_emit_token(word_start, byte_len, char_count, cs, out);
 
-        /* We lowercase the token using the charset's case-folding.
-           my_casedn_str operates on the full string respecting multi-byte sequences. */
-        fts_token_t tok;
-        tok.word.assign(word_start, byte_len);
-        size_t lowered_len =
-            cs->cset->casedn(cs, &tok.word[0], tok.word.size(), &tok.word[0], tok.word.size());
-        tok.word.resize(lowered_len);
-
-        /* We skip stop words (common words excluded from the index).
-           The check uses a read lock on the global stop word set. */
-        if (tdb_is_stopword(tok.word)) continue;
-
-        out.push_back(std::move(tok));
+            /* We also emit each sub-part split by blend chars */
+            const char *sub_start = word_start;
+            uint sub_chars = 0;
+            for (const char *s = word_start; s < word_start + byte_len; s++)
+            {
+                if (blend_map_copy[(uchar)*s])
+                {
+                    size_t sub_len = (size_t)(s - sub_start);
+                    if (sub_len > 0) fts_emit_token(sub_start, sub_len, sub_chars, cs, out);
+                    sub_start = s + 1;
+                    sub_chars = 0;
+                }
+                else
+                {
+                    sub_chars++;
+                }
+            }
+            /* We emit the last sub-part after the final blend char */
+            size_t sub_len = (size_t)((word_start + byte_len) - sub_start);
+            if (sub_len > 0) fts_emit_token(sub_start, sub_len, sub_chars, cs, out);
+        }
     }
 }
 
@@ -1564,6 +1669,17 @@ static MYSQL_SYSVAR_DOUBLE(fts_bm25_b, srv_fts_bm25_b, PLUGIN_VAR_RQCMDARG,
                            "Standard default is 0.75",
                            NULL, NULL, 0.75, 0.0, 1.0, 0);
 
+static MYSQL_SYSVAR_STR(fts_blend_chars, srv_fts_blend_chars,
+                        PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_MEMALLOC,
+                        "Characters treated as both separators and valid word characters "
+                        "in full-text indexing. When a blend character appears inside a "
+                        "token, the tokenizer emits both the full blended form and the "
+                        "individual parts. For example, with blend_chars=\"'\" the input "
+                        "\"l'aria\" produces tokens: l'aria, aria. "
+                        "Set to \"'\" for Italian/French elision support. "
+                        "Default is empty (no blend characters).",
+                        NULL, tdb_fts_blend_chars_update, NULL);
+
 static MYSQL_SYSVAR_STR(ft_stopword_table, srv_ft_stopword_table,
                         PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_MEMALLOC,
                         "User-defined stop word table in 'db_name/table_name' format. "
@@ -1894,6 +2010,7 @@ static struct st_mysql_sys_var *tidesdb_system_variables[] = {
     MYSQL_SYSVAR(fts_bm25_k1),
     MYSQL_SYSVAR(fts_bm25_b),
     MYSQL_SYSVAR(ft_stopword_table),
+    MYSQL_SYSVAR(fts_blend_chars),
     MYSQL_SYSVAR(data_home_dir),
     MYSQL_SYSVAR(ttl),
     MYSQL_SYSVAR(skip_unique_check),
@@ -3052,6 +3169,10 @@ static int tidesdb_init_func(void *p)
     tdb_load_default_stopwords();
     sql_print_information("TIDESDB: Loaded %zu default stop words", tdb_stopwords.size());
 
+    /* Initialize FTS blend chars */
+    mysql_rwlock_init(tdb_blend_lock_key, &tdb_blend_lock);
+    tdb_rebuild_blend_map(srv_fts_blend_chars);
+
     /* We use tidesdb_data_home_dir if set, otherwise compute
        a sibling directory of the MariaDB data directory. */
     if (srv_data_home_dir && srv_data_home_dir[0])
@@ -3192,6 +3313,7 @@ static int tidesdb_deinit_func(void *p)
 
     mysql_mutex_destroy(&last_conflict_mutex);
     mysql_rwlock_destroy(&tdb_stopword_lock);
+    mysql_rwlock_destroy(&tdb_blend_lock);
     tdb_stopwords.clear();
 
     if (lock_partitions)
