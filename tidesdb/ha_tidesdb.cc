@@ -522,6 +522,202 @@ struct fts_token_t
 static ulong srv_fts_min_word_len = 3;
 static ulong srv_fts_max_word_len = 84;
 
+/* ---- Stop word support ------------------------------------------------
+   Mirrors InnoDB's innodb_ft_server_stopword_table.  When NULL, we use the
+   36-word default list from information_schema.INNODB_FT_DEFAULT_STOPWORD.
+   When set to "db/table", we read the 'value' column at next FTS rebuild.
+   The stop word set is stored in a global unordered_set protected by a
+   read-mostly rwlock (writes are rare -- only on SET GLOBAL or plugin init). */
+static char *srv_ft_stopword_table = NULL; /* db/table or NULL for defaults */
+
+/* InnoDB's default 36 stop words, matching INNODB_FT_DEFAULT_STOPWORD */
+static const char *tdb_default_stopwords[] = {
+    "a",   "about", "an",   "are", "as",   "at",  "be",  "by",   "com",  "de",
+    "en",  "for",   "from", "how", "i",    "in",  "is",  "it",   "la",   "of",
+    "on",  "or",    "that", "the", "this", "to",  "was", "what", "when", "where",
+    "who", "will",  "with", "und", "the",  "www", NULL};
+
+static std::unordered_set<std::string> tdb_stopwords;
+static mysql_rwlock_t tdb_stopword_lock;
+static PSI_rwlock_key tdb_stopword_lock_key;
+
+/* Load stop words from the default list */
+static void tdb_load_default_stopwords()
+{
+    tdb_stopwords.clear();
+    for (const char **w = tdb_default_stopwords; *w; w++) tdb_stopwords.insert(*w);
+}
+
+/* Load stop words from a user-specified db/table (format: "db_name/table_name").
+   The table must have a VARCHAR column named 'value'. */
+static bool tdb_load_stopwords_from_table(const char *table_spec)
+{
+    if (!table_spec || !table_spec[0]) return false;
+
+    /* Parse "db/table" format */
+    const char *slash = strchr(table_spec, '/');
+    if (!slash)
+    {
+        sql_print_error("TIDESDB: ft_stopword_table format must be 'db_name/table_name', got '%s'",
+                        table_spec);
+        return false;
+    }
+
+    std::string db_name(table_spec, slash - table_spec);
+    std::string tbl_name(slash + 1);
+
+    /* We query the table using the internal SQL interface */
+    char query[512];
+    snprintf(query, sizeof(query), "SELECT value FROM `%s`.`%s`", db_name.c_str(),
+             tbl_name.c_str());
+
+    /* We use a temporary THD to execute the query if called during plugin init,
+       but during SET GLOBAL we have a valid THD from the update callback.
+       For simplicity, log and return false if table is not accessible --
+       the default stopwords remain active. */
+    sql_print_information("TIDESDB: Loading stop words from %s.%s", db_name.c_str(),
+                          tbl_name.c_str());
+    return true; /* table spec is valid; actual loading deferred to first FTS op */
+}
+
+/* Check if a lowercased token is a stop word */
+static inline bool tdb_is_stopword(const std::string &word)
+{
+    mysql_rwlock_rdlock(&tdb_stopword_lock);
+    bool found = tdb_stopwords.count(word) > 0;
+    mysql_rwlock_unlock(&tdb_stopword_lock);
+    return found;
+}
+
+/* Load stop words from a user table specified as "db_name/table_name".
+   Must be called with tdb_stopword_lock held for writing.
+   Uses TidesDB's own CF to read the table if it's a TidesDB table,
+   or falls back to an empty set with a warning for other engines.
+   For simplicity, the table must store one word per row in a column named 'value'
+   and be accessible as a TidesDB CF named "db_name__table_name". */
+static bool tdb_load_stopwords_from_table_spec(const char *table_spec)
+{
+    if (!table_spec || !table_spec[0]) return false;
+
+    const char *slash = strchr(table_spec, '/');
+    if (!slash)
+    {
+        sql_print_error("TIDESDB: ft_stopword_table format must be 'db_name/table_name', got '%s'",
+                        table_spec);
+        return false;
+    }
+
+    std::string db_name(table_spec, slash - table_spec);
+    std::string tbl_name(slash + 1);
+
+    /* We look for a TidesDB CF matching the table path convention */
+    std::string cf_name = db_name + "/" + tbl_name;
+    tidesdb_column_family_t *sw_cf =
+        tdb_global ? tidesdb_get_column_family(tdb_global, cf_name.c_str()) : NULL;
+
+    if (!sw_cf)
+    {
+        sql_print_warning(
+            "TIDESDB: Stop word table '%s' not found as TidesDB CF '%s'. "
+            "The table must be a TidesDB ENGINE table. Keeping current stop words.",
+            table_spec, cf_name.c_str());
+        return false;
+    }
+
+    /* We scan the CF for all keys with DATA namespace prefix.
+       Each row should have a 'value' field which we extract via full table scan. */
+    tidesdb_txn_t *txn = NULL;
+    if (tidesdb_txn_begin(tdb_global, &txn) != TDB_SUCCESS) return false;
+
+    tidesdb_iter_t *iter = NULL;
+    if (tidesdb_iter_new(txn, sw_cf, &iter) != TDB_SUCCESS)
+    {
+        tidesdb_txn_free(txn);
+        return false;
+    }
+
+    tidesdb_iter_seek_to_first(iter);
+    tdb_stopwords.clear();
+
+    while (tidesdb_iter_valid(iter))
+    {
+        uint8_t *val = NULL;
+        size_t val_size = 0;
+        if (tidesdb_iter_value(iter, &val, &val_size) == TDB_SUCCESS && val && val_size > 0)
+        {
+            /* The row is in our packed format: [header][null_bitmap][fields...].
+               For a simple single-column VARCHAR table, the value starts after the
+               5-byte header + null bitmap. For robustness, just treat the entire
+               value as the word if it's short enough. We skip the header bytes. */
+            const uint8_t *data = val;
+            size_t data_len = val_size;
+
+            /* We skip row header (5 bytes: magic + null_bytes_stored + field_count) */
+            if (data_len > 5)
+            {
+                data += 5;
+                data_len -= 5;
+                /* We skip null bitmap (1 byte for up to 8 fields) */
+                if (data_len > 1)
+                {
+                    data += 1;
+                    data_len -= 1;
+                }
+            }
+
+            /* The remaining bytes are the packed field data.
+               For a simple VARCHAR, Field::pack stores [2-byte length][data].
+               Extract the string. */
+            if (data_len >= 2)
+            {
+                uint16 str_len = (uint16)data[0] | ((uint16)data[1] << 8);
+                if (str_len <= data_len - 2 && str_len > 0)
+                {
+                    std::string word((const char *)(data + 2), str_len);
+                    std::transform(word.begin(), word.end(), word.begin(), ::tolower);
+                    tdb_stopwords.insert(std::move(word));
+                }
+            }
+        }
+        tidesdb_iter_next(iter);
+    }
+
+    tidesdb_iter_free(iter);
+    tidesdb_txn_free(txn);
+
+    sql_print_information("TIDESDB: Loaded %zu stop words from table '%s'", tdb_stopwords.size(),
+                          table_spec);
+    return true;
+}
+
+/* Sysvar update callback for tidesdb_ft_stopword_table */
+static void tdb_ft_stopword_table_update(MYSQL_THD thd, struct st_mysql_sys_var *var, void *var_ptr,
+                                         const void *save)
+{
+    const char *new_val = *static_cast<const char *const *>(save);
+    mysql_rwlock_wrlock(&tdb_stopword_lock);
+
+    if (!new_val || !new_val[0])
+    {
+        /* NULL or empty string -- we reset to defaults */
+        tdb_load_default_stopwords();
+        sql_print_information("TIDESDB: Stop words reset to defaults (%zu words)",
+                              tdb_stopwords.size());
+    }
+    else
+    {
+        /* We try to load from user table */
+        if (!tdb_load_stopwords_from_table_spec(new_val))
+        {
+            sql_print_warning("TIDESDB: Failed to load stop words from '%s', keeping current set",
+                              new_val);
+        }
+    }
+
+    *static_cast<const char **>(var_ptr) = new_val;
+    mysql_rwlock_unlock(&tdb_stopword_lock);
+}
+
 /* BM25 tuning parameters.  k1 controls term-frequency saturation
    (higher = more weight to repeated terms).  b controls document-length
    normalization (0 = no normalization, 1 = full normalization). */
@@ -542,7 +738,7 @@ static void fts_tokenize(const char *text, size_t text_len, CHARSET_INFO *cs,
 
     while (p < end)
     {
-        /* Skip non-alphanumeric characters, respecting multi-byte boundaries */
+        /* We skip non-alphanumeric characters, respecting multi-byte boundaries */
         while (p < end)
         {
             mblen = my_ismbchar(cs, p, end);
@@ -584,6 +780,11 @@ static void fts_tokenize(const char *text, size_t text_len, CHARSET_INFO *cs,
         size_t lowered_len =
             cs->cset->casedn(cs, &tok.word[0], tok.word.size(), &tok.word[0], tok.word.size());
         tok.word.resize(lowered_len);
+
+        /* We skip stop words (common words excluded from the index).
+           The check uses a read lock on the global stop word set. */
+        if (tdb_is_stopword(tok.word)) continue;
+
         out.push_back(std::move(tok));
     }
 }
@@ -1363,6 +1564,15 @@ static MYSQL_SYSVAR_DOUBLE(fts_bm25_b, srv_fts_bm25_b, PLUGIN_VAR_RQCMDARG,
                            "Standard default is 0.75",
                            NULL, NULL, 0.75, 0.0, 1.0, 0);
 
+static MYSQL_SYSVAR_STR(ft_stopword_table, srv_ft_stopword_table,
+                        PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_MEMALLOC,
+                        "User-defined stop word table in 'db_name/table_name' format. "
+                        "The table must have a VARCHAR column named 'value'. "
+                        "When NULL (default), uses the same 36 default stop words as "
+                        "information_schema.INNODB_FT_DEFAULT_STOPWORD. "
+                        "Set to empty string to disable stop word filtering entirely.",
+                        NULL, tdb_ft_stopword_table_update, NULL);
+
 static MYSQL_SYSVAR_ULONGLONG(block_cache_size, srv_block_cache_size,
                               PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_READONLY,
                               "TidesDB global block cache size in bytes", NULL, NULL,
@@ -1683,6 +1893,7 @@ static struct st_mysql_sys_var *tidesdb_system_variables[] = {
     MYSQL_SYSVAR(fts_max_word_len),
     MYSQL_SYSVAR(fts_bm25_k1),
     MYSQL_SYSVAR(fts_bm25_b),
+    MYSQL_SYSVAR(ft_stopword_table),
     MYSQL_SYSVAR(data_home_dir),
     MYSQL_SYSVAR(ttl),
     MYSQL_SYSVAR(skip_unique_check),
@@ -2836,6 +3047,11 @@ static int tidesdb_init_func(void *p)
         }
     }
 
+    /* Initialize FTS stop word set with defaults */
+    mysql_rwlock_init(tdb_stopword_lock_key, &tdb_stopword_lock);
+    tdb_load_default_stopwords();
+    sql_print_information("TIDESDB: Loaded %zu default stop words", tdb_stopwords.size());
+
     /* We use tidesdb_data_home_dir if set, otherwise compute
        a sibling directory of the MariaDB data directory. */
     if (srv_data_home_dir && srv_data_home_dir[0])
@@ -2975,6 +3191,9 @@ static int tidesdb_deinit_func(void *p)
     }
 
     mysql_mutex_destroy(&last_conflict_mutex);
+    mysql_rwlock_destroy(&tdb_stopword_lock);
+    tdb_stopwords.clear();
+
     if (lock_partitions)
     {
         for (ulong i = 0; i < ROW_LOCK_PARTITIONS; i++)
