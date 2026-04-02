@@ -71,7 +71,7 @@
 #   ./install.sh --tidesdb-prefix /opt/tidesdb --mariadb-prefix /opt/mariadb
 #   ./install.sh --mariadb-version mariadb-12.1.2
 #   ./install.sh --skip-deps --skip-tidesdb
-#   ./install.sh --pgo          # Full PGO build (instrument → train → optimize)
+#   ./install.sh --pgo          # Full PGO build (instrument -> train -> optimize)
 #   ./install.sh --list-engines # Show which engines can be skipped
 #   ./install.sh --skip-engines mroonga,rocksdb,connect,spider,oqgraph,columnstore
 # ─────────────────────────────────────────────────────────────────────────────
@@ -701,12 +701,13 @@ collation-server = utf8mb4_general_ci
 plugin_maturity = gamma
 plugin_load_add = ha_tidesdb.${plugin_ext}
 
-# TidesDB settings (defaults shown - tune as needed)
+# TidesDB settings (tune as needed)
 tidesdb_flush_threads = 4
 tidesdb_compaction_threads = 4
-tidesdb_block_cache_size = 268435456
+tidesdb_block_cache_size = 256M
 tidesdb_max_open_sstables = 256
 tidesdb_log_level = WARN
+tidesdb_unified_memtable_write_buffer_size = 256M
 
 [client]
 port = 3306
@@ -859,6 +860,14 @@ rebuild_plugin() {
     # Point cmake at the TidesDB library
     export TIDESDB_ROOT="${TIDESDB_PREFIX}"
 
+    # Sync the S3 setting with the current --s3 flag so cached builds
+    # don't keep a stale TIDESDB_WITH_S3 value from a previous configure.
+    if $WITH_S3; then
+        cmake "${mariadb_build}" -DTIDESDB_WITH_S3=ON
+    else
+        cmake "${mariadb_build}" -DTIDESDB_WITH_S3=OFF
+    fi
+
     # Build just the plugin target
     info "Building tidesdb plugin target (${JOBS} jobs)..."
     cmake --build "${mariadb_build}" --target tidesdb --parallel "${JOBS}"
@@ -882,7 +891,7 @@ rebuild_plugin() {
         die "Plugin directory not found at ${MARIADB_PREFIX}/lib/plugin or lib64/plugin"
     fi
 
-    info "Installing ha_tidesdb.${plugin_ext} → ${plugin_dir}/"
+    info "Installing ha_tidesdb.${plugin_ext} -> ${plugin_dir}/"
     run_privileged cp -f "${built_so}" "${plugin_dir}/"
 
     ok "Plugin rebuilt and installed"

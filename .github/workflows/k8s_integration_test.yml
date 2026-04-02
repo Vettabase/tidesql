@@ -677,7 +677,7 @@ jobs:
         # The replica should now be promoted and accept writes
         sleep 5
 
-        # Verify data survived promotion (items table already cached — no discovery needed)
+        # Verify data survived promotion (items table already cached - no discovery needed)
         RESULT=$(timeout 10 kubectl exec -n tidesql tidesql-replica -- \
           mariadb --connect-timeout=5 -N -e "SELECT COUNT(*) FROM k8s_test.items" 2>/dev/null || echo "0")
         echo "Post-auto-failover row count: $RESULT"

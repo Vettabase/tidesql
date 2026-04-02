@@ -11,10 +11,8 @@
 # but WITHOUT ANY WARRANTY, to the extent permitted by law; without
 # even the implied warranty of MERCHANTABILITY or FITNESS FOR A
 # PARTICULAR PURPOSE.
-
-
-
-# Copyright (c) 2026 TidesDB
+#	
+# Copyright (c) 2026 TidesDB Corp.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
