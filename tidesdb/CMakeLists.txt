@@ -1,4 +1,4 @@
-# Copyright (c) 2026 TidesDB
+# Copyright (c) 2026 TidesDB Corp.
 # 
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -13,9 +13,9 @@
 # along with this program; if not, write to the Free Software
 # Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 
-############# Optional -- Plugin-level ASAN + UBSAN #############
-# Enable with: cmake -DTIDESDB_WITH_ASAN=ON -DTIDESDB_WITH_UBSAN=ON ..
-# This instruments only the TidesDB plugin .so, not the whole server.
+############# Optional Plugin-level ASAN + UBSAN #############
+# You enable with cmake -DTIDESDB_WITH_ASAN=ON -DTIDESDB_WITH_UBSAN=ON ..
+# This instruments only the TidesDB plugin .so, not the whole server, though its good to build the server with sanitizers too.
 # At runtime, LD_PRELOAD the ASAN runtime for shared-lib mode:
 #   export LD_PRELOAD=$(gcc -print-file-name=libasan.so)
 #   export ASAN_OPTIONS=detect_leaks=0:abort_on_error=1
@@ -49,7 +49,7 @@ FIND_LIBRARY(TIDESDB_LIB
         PATH_SUFFIXES lib
 )
 
-############# Find compression libraries -- always use FIND_LIBRARY to get full paths.    #############
+############# We find compression libraries and always use FIND_LIBRARY to get full paths.#############
 ############# We cannot use pkg-config because it returns library names like "zstd" which #############
 ############# conflict with MariaDB's own "zstd" MODULE target (provider_zstd plugin).    #############
 FIND_LIBRARY(ZSTD_LIBRARY
@@ -88,9 +88,9 @@ FIND_LIBRARY(SNAPPY_LIBRARY
         "$ENV{VCPKG_INSTALLATION_ROOT}/installed/x64-windows/lib"
 )
 
-############# Find include directories #############
-# Look for tidesdb/db.h to get the parent include directory
-# The code uses #include <tidesdb/db.h> so we need the parent of the tidesdb folder
+############# We find include directories #############
+# We look for tidesdb/db.h to get the parent include directory
+# The plugin primarily uses #include <tidesdb/db.h> so we need the parent of the tidesdb folder
 FIND_PATH(TIDESDB_INCLUDE_DIR
         NAMES tidesdb/db.h
         HINTS
@@ -127,7 +127,7 @@ IF(TIDESDB_INCLUDE_DIR)
   INCLUDE_DIRECTORIES(${TIDESDB_INCLUDE_DIR})
 ENDIF()
 
-############# Build list of libraries to link -- use full paths from FIND_LIBRARY ############
+############# Build list of libraries to link -- we use full paths from FIND_LIBRARY ############
 SET(TIDESDB_LIBS ${TIDESDB_LIB} ${ZSTD_LIBRARY} ${LZ4_LIBRARY})
 
 IF(SNAPPY_LIBRARY)

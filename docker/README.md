@@ -1,6 +1,6 @@
 # TIDESQL Docker Images
 
-This directory contains Dockerfiles for running TidesSQL (MariaDB + TidesDB
+This directory contains Dockerfiles for running TideSQL (MariaDB + TidesDB
 storage engine) in a container.
 
 

@@ -61,7 +61,7 @@ if [ -n "${EXCLUDE_ENGINES:-}" ]; then
         done
         DISABLED_ENGINES="$(echo "$EXCL_NORM" | tr ' ' ',')"
     fi
-    # EXCLUDE_ENGINES=ALL → include all optional engines → DISABLED_ENGINES=""
+    # EXCLUDE_ENGINES=ALL -> include all optional engines -> DISABLED_ENGINES=""
 
 elif [ -n "${INCLUDE_ENGINES:-}" ]; then
     INCL_NORM="$(_upper_space "$INCLUDE_ENGINES")"

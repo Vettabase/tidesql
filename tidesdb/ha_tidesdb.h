@@ -85,7 +85,7 @@ static constexpr time_t TIDESDB_TTL_NONE = (time_t)-1;
 static constexpr ulonglong TIDESDB_DEFAULT_BLOCK_CACHE = 256ULL * 1024 * 1024; /* 256M */
 
 /*
-  TidesDB_share -- shared state for one table, visible to ALL handler objects.
+  TidesDB_share -- shared state for one table, visible to all handler objects.
 */
 class TidesDB_share : public Handler_share
 {
@@ -178,7 +178,7 @@ class ha_tidesdb_inplace_ctx : public inplace_alter_handler_ctx
 
 /*
   Per-connection TidesDB transaction context.
-  Stored via thd_set_ha_data(); shared by ALL handler objects on the
+  Stored via thd_set_ha_data(); shared by all handler objects on the
   same connection.  The TidesDB txn spans the entire BEGIN...COMMIT
   block (or a single auto-commit statement).
 */
