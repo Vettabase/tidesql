@@ -379,11 +379,13 @@ struct tdb_fts_result_t
 struct tdb_ft_info_t
 {
     struct _ft_vft *please;                /* required by MariaDB FT_INFO layout */
+    struct _ft_vft_ext *could_you;         /* extended FT API (HA_CAN_FULLTEXT_EXT) */
     ha_tidesdb *handler;                   /* back-pointer for row fetching */
     uint keynr;                            /* which FTS index */
     std::vector<tdb_fts_result_t> results; /* sorted by rank descending */
     size_t current_idx;                    /* iteration position */
     float current_rank;                    /* rank of last-returned row */
+    ulonglong match_count;                 /* total matches for count_matches() */
 };
 
 /* Forward declarations of FT_INFO vtable callbacks */
@@ -396,6 +398,34 @@ static void tdb_fts_reinit_search(FT_INFO *);
 static const struct _ft_vft tdb_ft_vft = {tdb_fts_read_next, tdb_fts_find_relevance,
                                           tdb_fts_close_search, tdb_fts_get_relevance,
                                           tdb_fts_reinit_search};
+
+/* Extended FT API callbacks for HA_CAN_FULLTEXT_EXT */
+static uint tdb_fts_get_version()
+{
+    return 2;
+}
+
+static ulonglong tdb_fts_get_flags()
+{
+    return FTS_ORDERED_RESULT;
+}
+
+static ulonglong tdb_fts_get_docid(FT_INFO_EXT *fts)
+{
+    tdb_ft_info_t *info = reinterpret_cast<tdb_ft_info_t *>(fts);
+    if (info->current_idx > 0 && info->current_idx <= info->results.size())
+        return (ulonglong)(info->current_idx); /* 1-based doc ID */
+    return 0;
+}
+
+static ulonglong tdb_fts_count_matches(FT_INFO_EXT *fts)
+{
+    tdb_ft_info_t *info = reinterpret_cast<tdb_ft_info_t *>(fts);
+    return info->match_count;
+}
+
+static struct _ft_vft_ext tdb_ft_vft_ext = {tdb_fts_get_version, tdb_fts_get_flags,
+                                            tdb_fts_get_docid, tdb_fts_count_matches};
 
 /* FT_INFO vtable callback implementations */
 static int tdb_fts_read_next(FT_INFO *, char *)
@@ -590,38 +620,6 @@ static void tdb_load_default_stopwords()
 {
     tdb_stopwords.clear();
     for (const char **w = tdb_default_stopwords; *w; w++) tdb_stopwords.insert(*w);
-}
-
-/* Load stop words from a user-specified db/table (format: "db_name/table_name").
-   The table must have a VARCHAR column named 'value'. */
-static bool tdb_load_stopwords_from_table(const char *table_spec)
-{
-    if (!table_spec || !table_spec[0]) return false;
-
-    /* Parse "db/table" format */
-    const char *slash = strchr(table_spec, '/');
-    if (!slash)
-    {
-        sql_print_error("TIDESDB: ft_stopword_table format must be 'db_name/table_name', got '%s'",
-                        table_spec);
-        return false;
-    }
-
-    std::string db_name(table_spec, slash - table_spec);
-    std::string tbl_name(slash + 1);
-
-    /* We query the table using the internal SQL interface */
-    char query[512];
-    snprintf(query, sizeof(query), "SELECT value FROM `%s`.`%s`", db_name.c_str(),
-             tbl_name.c_str());
-
-    /* We use a temporary THD to execute the query if called during plugin init,
-       but during SET GLOBAL we have a valid THD from the update callback.
-       For simplicity, log and return false if table is not accessible --
-       the default stopwords remain active. */
-    sql_print_information("TIDESDB: Loading stop words from %s.%s", db_name.c_str(),
-                          tbl_name.c_str());
-    return true; /* table spec is valid; actual loading deferred to first FTS op */
 }
 
 /* Check if a lowercased token is a stop word */
@@ -6683,6 +6681,91 @@ int ha_tidesdb::optimize(THD *thd, HA_CHECK_OPT *check_opt)
     DBUG_RETURN(HA_ADMIN_OK);
 }
 
+int ha_tidesdb::check(THD *thd, HA_CHECK_OPT *check_opt)
+{
+    DBUG_ENTER("ha_tidesdb::check");
+
+    if (!share || !share->cf) DBUG_RETURN(HA_ADMIN_CORRUPT);
+
+    /* CHECK TABLE verifies all CFs are readable by fetching stats.
+       tidesdb_get_stats reads metadata from all SSTables, which validates
+       that manifests, block indexes, bloom filters, and metadata blocks
+       are intact. For a deeper check, users can run REPAIR TABLE which
+       does a full compaction pass that reads and re-checksums every block. */
+    tidesdb_stats_t *st = NULL;
+    int rc = tidesdb_get_stats(share->cf, &st);
+    if (rc != TDB_SUCCESS)
+    {
+        sql_print_error("TIDESDB: CHECK TABLE '%s': data CF check failed (err=%d)",
+                        share->cf_name.c_str(), rc);
+        DBUG_RETURN(HA_ADMIN_CORRUPT);
+    }
+    tidesdb_free_stats(st);
+
+    for (uint i = 0; i < share->idx_cfs.size(); i++)
+    {
+        if (!share->idx_cfs[i]) continue;
+        tidesdb_stats_t *ist = NULL;
+        rc = tidesdb_get_stats(share->idx_cfs[i], &ist);
+        if (rc != TDB_SUCCESS)
+        {
+            sql_print_error("TIDESDB: CHECK TABLE '%s': index CF '%s' check failed (err=%d)",
+                            share->cf_name.c_str(), share->idx_cf_names[i].c_str(), rc);
+            DBUG_RETURN(HA_ADMIN_CORRUPT);
+        }
+        tidesdb_free_stats(ist);
+    }
+
+    DBUG_RETURN(HA_ADMIN_OK);
+}
+
+int ha_tidesdb::repair(THD *thd, HA_CHECK_OPT *check_opt)
+{
+    DBUG_ENTER("ha_tidesdb::repair");
+
+    if (!share || !share->cf) DBUG_RETURN(HA_ADMIN_FAILED);
+
+    /* REPAIR TABLE triggers a full purge (flush + compaction) of all CFs.
+       In unified memtable mode, the first purge_cf call rotates the shared
+       unified memtable and waits for the flush to complete. Subsequent
+       purge_cf calls on index CFs skip the rotation (already done) and
+       just run per-CF compaction. tidesdb_purge_cf is unified-mode aware
+       and handles this idempotently. */
+    int rc = tidesdb_purge_cf(share->cf);
+    if (rc != TDB_SUCCESS)
+    {
+        sql_print_error("TIDESDB: REPAIR TABLE '%s': purge data CF failed (err=%d)",
+                        share->cf_name.c_str(), rc);
+        DBUG_RETURN(HA_ADMIN_FAILED);
+    }
+
+    for (uint i = 0; i < share->idx_cfs.size(); i++)
+    {
+        if (!share->idx_cfs[i]) continue;
+        rc = tidesdb_purge_cf(share->idx_cfs[i]);
+        if (rc != TDB_SUCCESS)
+            sql_print_warning("TIDESDB: REPAIR TABLE '%s': purge idx CF '%s' failed (err=%d)",
+                              share->cf_name.c_str(), share->idx_cf_names[i].c_str(), rc);
+    }
+
+    share->stats_refresh_us.store(0, std::memory_order_relaxed);
+    DBUG_RETURN(HA_ADMIN_OK);
+}
+
+/* Semi-consistent read -- allows UPDATE/DELETE at READ_COMMITTED to skip
+   locked rows by reading the last committed version instead of blocking. */
+bool ha_tidesdb::was_semi_consistent_read()
+{
+    bool was = did_semi_consistent_read_;
+    did_semi_consistent_read_ = false;
+    return was;
+}
+
+void ha_tidesdb::try_semi_consistent_read(bool yes)
+{
+    semi_consistent_read_ = yes;
+}
+
 IO_AND_CPU_COST ha_tidesdb::scan_time()
 {
     IO_AND_CPU_COST cost;
@@ -7244,10 +7327,12 @@ FT_INFO *ha_tidesdb::ft_init_ext(uint flags, uint inx, String *key)
     /* We build sorted result set */
     tdb_ft_info_t *info = new tdb_ft_info_t();
     info->please = const_cast<_ft_vft *>(&tdb_ft_vft);
+    info->could_you = &tdb_ft_vft_ext;
     info->handler = this;
     info->keynr = inx;
     info->current_idx = 0;
     info->current_rank = 0.0f;
+    info->match_count = 0;
 
     for (auto &[pk_str, score] : doc_scores)
     {
@@ -7305,6 +7390,8 @@ FT_INFO *ha_tidesdb::ft_init_ext(uint flags, uint inx, String *key)
 
     std::sort(info->results.begin(), info->results.end(),
               [](const tdb_fts_result_t &a, const tdb_fts_result_t &b) { return a.rank > b.rank; });
+
+    info->match_count = (ulonglong)info->results.size();
 
     DBUG_RETURN(reinterpret_cast<FT_INFO *>(info));
 }
@@ -8297,7 +8384,15 @@ static long long srv_stat_cache_misses;
 static double srv_stat_cache_hit_rate;
 static long long srv_stat_cache_partitions;
 
+#define TIDESQL_VERSION_STR "4.2.2"
+#define TIDESQL_VERSION_HEX 0x40202
+
+static const char *srv_stat_version = TIDESQL_VERSION_STR;
+static long long srv_stat_version_hex = TIDESQL_VERSION_HEX;
+
 static struct st_mysql_show_var tidesdb_status_variables[] = {
+    {"tidesdb_version", (char *)&srv_stat_version, SHOW_CHAR_PTR},
+    {"tidesdb_version_hex", (char *)&srv_stat_version_hex, SHOW_LONGLONG},
     {"tidesdb_column_families", (char *)&srv_stat_column_families, SHOW_LONGLONG},
     {"tidesdb_global_sequence", (char *)&srv_stat_global_seq, SHOW_LONGLONG},
     {"tidesdb_memtable_bytes", (char *)&srv_stat_memtable_bytes, SHOW_LONGLONG},
@@ -8367,8 +8462,8 @@ maria_declare_plugin(tidesdb){MYSQL_STORAGE_ENGINE_PLUGIN,
                               PLUGIN_LICENSE_GPL,
                               tidesdb_init_func,
                               tidesdb_deinit_func,
-                              0x40201,
+                              TIDESQL_VERSION_HEX,
                               tidesdb_status_variables,
                               tidesdb_system_variables,
-                              "4.2.1",
+                              TIDESQL_VERSION_STR,
                               MariaDB_PLUGIN_MATURITY_GAMMA} maria_declare_plugin_end;
