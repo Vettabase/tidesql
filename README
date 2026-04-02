@@ -228,8 +228,12 @@ Core:
 - Online backup (SET GLOBAL tidesdb_backup_dir = '/path')
 - Hard-link checkpoint (SET GLOBAL tidesdb_checkpoint_dir = '/path')
 - OPTIMIZE TABLE (synchronous purge + compact via tidesdb_purge_cf)
+- CHECK TABLE (verifies SSTable metadata and block integrity)
+- REPAIR TABLE (full purge + compaction, rebuilds LSM tree)
+- FLUSH TABLES FOR EXPORT (HA_CAN_EXPORT, consistent file copy)
+- Semi-consistent read (optimistic reads for UPDATE/DELETE at READ_COMMITTED)
 - SHOW ENGINE TIDESDB STATUS (DB stats, memory, cache, conflict info)
-- SHOW GLOBAL STATUS LIKE 'tidesdb%' (19 machine-readable status variables
+- SHOW GLOBAL STATUS LIKE 'tidesdb%' (21 machine-readable status variables
   for monitoring tools: Prometheus, PMM, Datadog, etc.)
 - Partitioning (RANGE, LIST, HASH, KEY)
 - Data-at-rest encryption (MariaDB encryption plugin integration)
@@ -238,7 +242,9 @@ Core:
 - ANALYZE TABLE with detailed CF statistics (levels, keys, sizes, cache hit rate)
 - Cached optimizer statistics (refreshed every 2 seconds from TidesDB)
 - Full-text search (FULLTEXT indexes with BM25 ranking, natural language
-  and boolean mode, charset-aware tokenizer, configurable BM25 parameters)
+  and boolean mode, charset-aware tokenizer, configurable BM25 parameters,
+  stop words matching InnoDB defaults, blend_chars for Romance language
+  elision support, extended FT API via HA_CAN_FULLTEXT_EXT)
 - Vector search (VECTOR indexes via MariaDB's MHNSW approximate nearest
   neighbor, Euclidean and cosine distance, INSERT/UPDATE/DELETE support)
 - Spatial indexes (SPATIAL KEY with Hilbert curve encoding on LSM,
@@ -315,6 +321,8 @@ Dynamic (SET GLOBAL at runtime):
   fts_max_word_len          Maximum word length for FTS indexing (default: 84)
   fts_bm25_k1               BM25 k1 term-frequency saturation (default: 1.2)
   fts_bm25_b                BM25 b document-length normalization (default: 0.75)
+  ft_stopword_table         Custom stop word table 'db/table' (default: NULL = InnoDB defaults)
+  fts_blend_chars           Blend characters for Romance elision (default: empty)
 
 Session (SET SESSION tidesdb_...):
 
@@ -377,6 +385,10 @@ Block Indexes:
 TTL:
   TTL                       Default TTL in seconds, 0 = none (default: 0)
 
+Object Store:
+  OBJECT_LAZY_COMPACTION    Double L1 compaction trigger in S3 mode (default: OFF)
+  OBJECT_PREFETCH_COMPACTION Prefetch inputs before merge in S3 mode (default: ON)
+
 Encryption:
   ENCRYPTED                 Enable data-at-rest encryption (default: OFF)
   ENCRYPTION_KEY_ID         Encryption key ID (default: 1)
@@ -407,7 +419,7 @@ Run specific test:
 
   perl mtr --suite=tidesdb tidesdb_crud
 
-Available tests (46 total, 260+ cases):
+Available tests (48 total, 280+ cases):
   tidesdb_alter_crash         Crash safety during ALTER TABLE operations
   tidesdb_analyze             ANALYZE TABLE with CF statistics output
   tidesdb_auto_increment      AUTO_INCREMENT edge cases (gaps, rollback, explicit values)
@@ -424,6 +436,8 @@ Available tests (46 total, 260+ cases):
   tidesdb_engine_status       SHOW ENGINE TIDESDB STATUS
   tidesdb_fulltext            Full-text search (FULLTEXT indexes, BM25, boolean mode)
   tidesdb_fulltext_phrase     FTS phrase queries ("exact phrase") and wildcard edge cases
+  tidesdb_fts_stopwords       FTS stop word filtering (default InnoDB stop words)
+  tidesdb_fts_blend_chars     FTS blend characters (Italian/French elision, O'Malley)
   tidesdb_hidden_pk           Tables without explicit PK (hidden auto-generated row ID)
   tidesdb_index_stats         Index statistics and optimizer cost model
   tidesdb_info_schema         information_schema integration

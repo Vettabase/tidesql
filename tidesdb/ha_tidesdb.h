@@ -402,8 +402,8 @@ class ha_tidesdb : public handler
                HA_FAST_KEY_READ | HA_REC_NOT_IN_SEQ | HA_CAN_SQL_HANDLER |
                HA_REQUIRES_KEY_COLUMNS_FOR_DELETE | HA_PRIMARY_KEY_REQUIRED_FOR_POSITION |
                HA_ONLINE_ANALYZE | HA_CAN_ONLINE_BACKUPS | HA_CONCURRENT_OPTIMIZE |
-               HA_CAN_TABLES_WITHOUT_ROLLBACK | HA_CAN_FULLTEXT | HA_CAN_GEOMETRY |
-               HA_CAN_RTREEKEYS;
+               HA_CAN_TABLES_WITHOUT_ROLLBACK | HA_CAN_FULLTEXT | HA_CAN_FULLTEXT_EXT |
+               HA_CAN_GEOMETRY | HA_CAN_RTREEKEYS | HA_CAN_EXPORT;
     }
 
     ulong index_flags(uint idx, uint part, bool all_parts) const override;
@@ -507,10 +507,21 @@ class ha_tidesdb : public handler
     int info(uint flag) override;
     int analyze(THD *thd, HA_CHECK_OPT *check_opt) override;
     int optimize(THD *thd, HA_CHECK_OPT *check_opt) override;
+    int check(THD *thd, HA_CHECK_OPT *check_opt) override;
+    int repair(THD *thd, HA_CHECK_OPT *check_opt) override;
     ha_rows records_in_range(uint inx, const key_range *min_key, const key_range *max_key,
                              page_range *pages) override;
     int extra(enum ha_extra_function operation) override;
 
+    /* Semi-consistent read for UPDATE/DELETE optimization */
+    bool was_semi_consistent_read() override;
+    void try_semi_consistent_read(bool yes) override;
+
+   private:
+    bool semi_consistent_read_{false};     /* try optimistic reads on locked rows */
+    bool did_semi_consistent_read_{false}; /* last read was optimistic */
+
+   public:
    protected:
     IO_AND_CPU_COST scan_time() override;
 
