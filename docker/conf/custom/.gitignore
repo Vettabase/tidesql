@@ -1,4 +1,4 @@
 # Ignore all custom configuration files except the example.
 *
 !.gitignore
-!00-example.cfg
+!00-example.cnf

@@ -2924,6 +2924,8 @@ static void schema_cf_rename(const char *from, const char *to)
     tidesdb_txn_free(txn);
 }
 
+static void schema_cf_ensure_databases();
+
 /*
   Handlerton discover_table callback.
   Called when MariaDB cannot find a .frm file on disk for a TidesDB table.
@@ -2946,6 +2948,19 @@ static int tidesdb_discover_table(handlerton *, THD *thd, TABLE_SHARE *share)
     tidesdb_txn_free(txn);
 
     if (rc != TDB_SUCCESS || !val) return HA_ERR_NO_SUCH_TABLE;
+
+    /* Ensure the database directory exists.  The primary may have created
+       this database after the replica started, and schema_cf_ensure_databases()
+       only runs at plugin init.  A single stat() + conditional mkdir(). */
+    {
+        char db_dir[FN_REFLEN];
+        size_t dh_len = strlen(mysql_real_data_home);
+        snprintf(db_dir, sizeof(db_dir), "%s%s%.*s", mysql_real_data_home,
+                 (dh_len > 0 && mysql_real_data_home[dh_len - 1] != '/') ? "/" : "",
+                 (int)share->db.length, share->db.str);
+        MY_STAT st;
+        if (!my_stat(db_dir, &st, MYF(0))) my_mkdir(db_dir, 0755, MYF(0));
+    }
 
     /* We verify the data CF actually exists before returning the .frm.
        If the .frm is in the schema CF but the data CF hasn't been synced
@@ -2981,6 +2996,10 @@ static int tidesdb_discover_table_names(handlerton *, const LEX_CSTRING *db, MY_
                                         handlerton::discovered_list *result)
 {
     if (!schema_cf) return 0;
+
+    /* Ensure database directories are up-to-date.  Picks up databases
+       created by the primary after this replica started. */
+    schema_cf_ensure_databases();
 
     /* We build prefix-- "db_name\0" */
     std::string prefix;
@@ -3030,6 +3049,9 @@ static int tidesdb_discover_table_names(handlerton *, const LEX_CSTRING *db, MY_
 static int tidesdb_discover_table_existence(handlerton *, const char *db, const char *table_name)
 {
     if (!schema_cf) return 0;
+
+    /* Ensure database directories are up-to-date for replica discovery. */
+    schema_cf_ensure_databases();
 
     LEX_CSTRING db_lex = {db, strlen(db)};
     LEX_CSTRING tbl_lex = {table_name, strlen(table_name)};
@@ -3212,7 +3234,7 @@ static int tidesdb_init_func(void *p)
 
     /* Object store connector setup */
     tidesdb_objstore_t *objstore_connector = NULL;
-    tidesdb_objstore_config_t objstore_cfg;
+    static tidesdb_objstore_config_t objstore_cfg;
 
     if (srv_object_store_backend == 1) /* S3 */
     {
@@ -8384,8 +8406,8 @@ static long long srv_stat_cache_misses;
 static double srv_stat_cache_hit_rate;
 static long long srv_stat_cache_partitions;
 
-#define TIDESQL_VERSION_STR "4.2.2"
-#define TIDESQL_VERSION_HEX 0x40202
+#define TIDESQL_VERSION_STR "4.2.3"
+#define TIDESQL_VERSION_HEX 0x40203
 
 static const char *srv_stat_version = TIDESQL_VERSION_STR;
 static long long srv_stat_version_hex = TIDESQL_VERSION_HEX;

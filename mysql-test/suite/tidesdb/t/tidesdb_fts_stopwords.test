@@ -1,4 +1,5 @@
 --source include/have_tidesdb.inc
+--source include/force_restart.inc
 
 --echo #
 --echo # TidesDB FTS stop word filtering
