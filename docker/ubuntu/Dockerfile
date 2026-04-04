@@ -38,8 +38,15 @@ COPY mysql-test/suite/tidesdb       /opt/tidesql/mysql-test/suite/tidesdb
 
 # 3. Build and install TidesDB library
 ARG WITH_S3=0
-RUN S3_FLAG=$([ "${WITH_S3}" = "1" ] && echo "-DTIDESDB_WITH_S3=ON" || true) && \
-    git clone --depth 1 --branch "${TIDESDB_VERSION}" \
+RUN TIDESDB_VER="${TIDESDB_VERSION}" && \
+    if [ -z "$TIDESDB_VER" ]; then \
+        TIDESDB_VER=$(curl -sf https://api.github.com/repos/tidesdb/tidesdb/releases/latest \
+            | grep '"tag_name"' | head -1 | cut -d'"' -f4) || true; \
+    fi && \
+    if [ -z "$TIDESDB_VER" ]; then echo "ERROR: could not resolve TidesDB version"; exit 1; fi && \
+    echo "Building TidesDB version: $TIDESDB_VER" && \
+    S3_FLAG=$([ "${WITH_S3}" = "1" ] && echo "-DTIDESDB_WITH_S3=ON" || true) && \
+    git clone --depth 1 --branch "$TIDESDB_VER" \
         https://github.com/tidesdb/tidesdb.git /tmp/tidesql-build/tidesdb-lib && \
     cmake \
         -S /tmp/tidesql-build/tidesdb-lib \
@@ -55,8 +62,15 @@ RUN S3_FLAG=$([ "${WITH_S3}" = "1" ] && echo "-DTIDESDB_WITH_S3=ON" || true) && 
     ldconfig && \
     rm -rf /tmp/tidesql-build/tidesdb-lib
 
-# 4. Clone MariaDB source and inject TidesDB storage engine plugin 
-RUN git clone --depth 1 --branch "${MARIADB_VERSION}" \
+# 4. Clone MariaDB source and inject TidesDB storage engine plugin
+RUN MARIADB_VER="${MARIADB_VERSION}" && \
+    if [ -z "$MARIADB_VER" ]; then \
+        MARIADB_VER=$(curl -sf https://api.github.com/repos/MariaDB/server/releases/latest \
+            | grep '"tag_name"' | head -1 | cut -d'"' -f4) || true; \
+    fi && \
+    if [ -z "$MARIADB_VER" ]; then echo "ERROR: could not resolve MariaDB version"; exit 1; fi && \
+    echo "Building MariaDB version: $MARIADB_VER" && \
+    git clone --depth 1 --branch "$MARIADB_VER" \
         https://github.com/MariaDB/server.git /tmp/tidesql-build/mariadb-server && \
     cd /tmp/tidesql-build/mariadb-server && \
     git submodule update --init --recursive --force && \
