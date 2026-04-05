@@ -4258,7 +4258,7 @@ int ha_tidesdb::create(const char *name, TABLE *table_arg, HA_CREATE_INFO *creat
         {
             tidesdb_column_family_config_t idx_cfg = cfg;
             ha_index_option_struct *iopts = table_arg->key_info[i].option_struct;
-            if (iopts && iopts->use_btree) idx_cfg.use_btree = 1;
+            if (iopts) idx_cfg.use_btree = iopts->use_btree ? 1 : 0;
 
             int rc = tidesdb_create_column_family(tdb_global, idx_cf.c_str(), &idx_cfg);
             if (rc != TDB_SUCCESS)
@@ -6297,7 +6297,7 @@ int ha_tidesdb::delete_all_rows(void)
         }
     }
 
-    /* We drop and recreate each secondary index CF */
+    /* We drop and recreate each secondary index CF, preserving per-index USE_BTREE */
     for (uint i = 0; i < share->idx_cfs.size(); i++)
     {
         if (!share->idx_cfs[i]) continue;
@@ -6305,7 +6305,14 @@ int ha_tidesdb::delete_all_rows(void)
         const std::string &idx_name = share->idx_cf_names[i];
         tidesdb_drop_column_family(tdb_global, idx_name.c_str());
 
-        int rc = tidesdb_create_column_family(tdb_global, idx_name.c_str(), &cfg);
+        tidesdb_column_family_config_t idx_cfg = cfg;
+        if (i < table->s->keys && table->key_info[i].option_struct)
+        {
+            ha_index_option_struct *iopts = table->key_info[i].option_struct;
+            idx_cfg.use_btree = iopts->use_btree ? 1 : 0;
+        }
+
+        int rc = tidesdb_create_column_family(tdb_global, idx_name.c_str(), &idx_cfg);
         if (rc != TDB_SUCCESS)
         {
             sql_print_warning("TIDESDB: truncate: failed to recreate idx CF '%s' (err=%d)",
@@ -7764,7 +7771,7 @@ bool ha_tidesdb::prepare_inplace_alter_table(TABLE *altered_table,
 
             tidesdb_column_family_config_t idx_cfg = cfg;
             ha_index_option_struct *iopts = new_key->option_struct;
-            if (iopts && iopts->use_btree) idx_cfg.use_btree = 1;
+            if (iopts) idx_cfg.use_btree = iopts->use_btree ? 1 : 0;
 
             int rc = tidesdb_create_column_family(tdb_global, idx_cf.c_str(), &idx_cfg);
             if (rc != TDB_SUCCESS)
@@ -8171,12 +8178,19 @@ bool ha_tidesdb::commit_inplace_alter_table(TABLE *altered_table, Alter_inplace_
                     share->cf_name.c_str(), rc);
         }
 
-        /* Secondary index CFs */
+        /* We apply per-index USE_BTREE overrides */
         for (uint i = 0; i < share->idx_cfs.size(); i++)
         {
             if (share->idx_cfs[i])
             {
-                int rc = tidesdb_cf_update_runtime_config(share->idx_cfs[i], &cfg, 1);
+                tidesdb_column_family_config_t idx_cfg = cfg;
+                if (i < altered_table->s->keys && altered_table->key_info[i].option_struct)
+                {
+                    ha_index_option_struct *iopts = altered_table->key_info[i].option_struct;
+                    idx_cfg.use_btree = iopts->use_btree ? 1 : 0;
+                }
+
+                int rc = tidesdb_cf_update_runtime_config(share->idx_cfs[i], &idx_cfg, 1);
                 if (rc != TDB_SUCCESS)
                     sql_print_information(
                         "TIDESDB: ALTER: failed to update runtime config for "
@@ -8406,8 +8420,8 @@ static long long srv_stat_cache_misses;
 static double srv_stat_cache_hit_rate;
 static long long srv_stat_cache_partitions;
 
-#define TIDESQL_VERSION_STR "4.2.3"
-#define TIDESQL_VERSION_HEX 0x40203
+#define TIDESQL_VERSION_STR "4.2.4"
+#define TIDESQL_VERSION_HEX 0x40204
 
 static const char *srv_stat_version = TIDESQL_VERSION_STR;
 static long long srv_stat_version_hex = TIDESQL_VERSION_HEX;
